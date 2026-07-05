@@ -1,0 +1,17 @@
+---
+ios_devices:
+  platform: cisco_ios
+  connection_options:
+    netmiko:
+      extras:
+        username: "admin"
+        password: "password"
+        # secret: "enablepass"
+
+tokyo:
+  data:
+    site: "tokyo"
+
+osaka:
+  data:
+    site: "osaka"

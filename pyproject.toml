@@ -1,0 +1,13 @@
+[project]
+name = "nornir-mcp-server"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "jinja2>=3.1.6",
+    "mcp[cli]>=1.28.1",
+    "nornir>=3.5.0",
+    "nornir-netbox>=0.3.0",
+    "nornir-netmiko>=1.0.1",
+]

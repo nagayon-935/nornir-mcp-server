@@ -1,0 +1,16 @@
+---
+router1:
+  hostname: "192.168.1.1"
+  groups:
+    - ios_devices
+    - tokyo
+  data:
+    role: "core"
+
+switch1:
+  hostname: "192.168.1.2"
+  groups:
+    - ios_devices
+    - osaka
+  data:
+    role: "access"
