@@ -33,6 +33,12 @@ uv sync
 ### 2. インベントリの設定
 デフォルトでは YAML ファイルを使用しますが、`config.yaml` を変更することで NetBox 等に切り替えられます。
 
+読み込む設定ファイルのパスは既定では `server.py` と同じディレクトリの `config.yaml` ですが、環境変数 `NORNIR_MCP_CONFIG` を設定することで任意のパスに変更できます（プロセスの起動ディレクトリに依存しません）。
+
+```bash
+export NORNIR_MCP_CONFIG=/path/to/config.yaml
+```
+
 `hosts.yaml` / `groups.yaml` は機器の認証情報を含むため `.gitignore` 対象です。テンプレートからコピーして作成してください。
 
 ```bash
@@ -111,17 +117,28 @@ docker run -i --rm \
 * 対象ホストのインベントリデータ (`host.data`) に `base_url` (例: `https://192.168.1.1`), `http_headers`, `tls_verify` (True/False) 等の情報を記載して利用します。
 
 ### `run_serial_command`
-直接シリアル接続（コンソールケーブル等）を用いてコマンドを実行します。
+直接シリアル接続（コンソールケーブル等）を用いてコマンドを実行します。物理ポートは同時に1つのプロセスからしか使えないため、対象が複数ホストでも常に1台ずつ順番に処理されます（並列実行しません）。
 * **引数**: `command` (実行するコマンド), `filter_criteria`
-* 対象ホストのインベントリデータに `serial_settings` (port, baudrate 等) の記載が必要です。
+* 対象ホストのインベントリデータに `serial_settings` (port, baudrate 等) の記載が必要です。Netmiko のシリアルドライバは `device_type` の末尾が `_serial` である必要があるため、`serial_settings.device_type` を明示するか、未指定の場合は `host.platform`（例: `cisco_ios`）に自動で `_serial` を付与します。
+* ログイン認証には `hosts.yaml` / `groups.yaml` / `defaults.yaml` の**トップレベル**の `username` / `password` を使用します。`connection_options.netmiko.extras` 配下の値（SSH接続用）は参照しないため、シリアル接続も使う場合はトップレベルにも認証情報を設定してください。
 
 ### `generate_config`
-Jinja2 テンプレートを用いて、インベントリ変数（`host.data` など）からコンフィグを動的生成します。（実機への適用は行いません）
+Jinja2 テンプレート（サンドボックス環境で実行）を用いて、コンフィグを動的生成します。（実機への適用は行いません）
 * **引数**: `template_string` (Jinja2テンプレート), `filter_criteria`
+* テンプレート内で参照できるのは `{{ host.name }}`, `{{ host.hostname }}`, `{{ host.platform }}`, `{{ host.groups }}`, `{{ host.data['key'] }}` のみです。認証情報などその他の属性は意図的に公開されません。
 
 ### `run_netmiko_config`
-生成したコンフィグや指定のコマンドリストを、対象機器に並列で設定投入 (Config Deploy) します。
+⚠️ **実機の設定を変更する破壊的な操作です。** 生成したコンフィグや指定のコマンドリストを、対象機器に並列で設定投入 (Config Deploy) します。
 * **引数**: `commands` (投入する設定コマンドのリスト), `filter_criteria`
+
+## テスト
+
+`tests/` にユニットテストがあります。
+
+```bash
+uv sync
+uv run pytest tests/ -v
+```
 
 ## License
 MIT License
