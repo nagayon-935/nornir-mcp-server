@@ -85,7 +85,7 @@ GitHub Actions により、`main` ブランチへのコミット時に自動で�
 Docker環境があれば、手元にリポジトリをcloneしなくてもすぐに利用可能です。
 
 ```bash
-docker pull ghcr.io/<あなたのGitHubユーザー名>/nornir-mcp-server:latest
+docker pull ghcr.io/nagayon-935/nornir-mcp-server:latest
 ```
 
 **起動例:**
