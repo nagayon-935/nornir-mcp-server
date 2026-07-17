@@ -1,36 +1,62 @@
 import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Optional
 
-from mcp.server.fastmcp import FastMCP
-from nornir import InitNornir
-from nornir.core.filter import F
-from nornir_netmiko.tasks import netmiko_send_command, netmiko_send_config
-from nornir.core.task import Result, Task
 import httpx
+from jinja2.sandbox import SandboxedEnvironment
+from mcp.server.fastmcp import FastMCP
 from netmiko import ConnectHandler
-from jinja2 import Template
+from nornir import InitNornir
+from nornir.core import Nornir
+from nornir.core.filter import F
+from nornir.core.task import AggregatedResult, Result, Task
+from nornir_netmiko.tasks import netmiko_send_command, netmiko_send_config
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nornir-mcp-server")
 
-CONFIG_FILE = "config.yaml"
+CONFIG_FILE = Path(os.environ.get("NORNIR_MCP_CONFIG", str(Path(__file__).parent / "config.yaml")))
+HTTP_TIMEOUT = 10.0
+SERIAL_DEVICE_TYPE_SUFFIX = "_serial"
 
 mcp = FastMCP("nornir server", dependencies=["nornir", "nornir-netmiko"])
 
-def _get_nornir(filter_criteria: Optional[dict[str, Any]] = None):
+# Jinja2 environments are thread-safe and shareable across renders.
+_JINJA_ENV = SandboxedEnvironment()
+
+def _get_nornir(filter_criteria: Optional[dict[str, Any]] = None, num_workers: Optional[int] = None) -> Nornir:
     """Initialize Nornir and apply filtering if provided."""
-    nr = InitNornir(config_file=CONFIG_FILE)
+    kwargs: dict[str, Any] = {}
+    if num_workers is not None:
+        kwargs["runner"] = {"plugin": "threaded", "options": {"num_workers": num_workers}}
+    nr = InitNornir(config_file=str(CONFIG_FILE), **kwargs)
     if filter_criteria:
         # F(**filter_criteria) allows matching by attributes like site, role, name, etc.
         nr = nr.filter(F(**filter_criteria))
     return nr
 
+def _format_agg_result(agg_result: AggregatedResult) -> str:
+    """Convert an AggregatedResult into a JSON string of per-host outputs/errors."""
+    output_data: dict[str, dict[str, Any]] = {}
+    for host_name, multi_result in agg_result.items():
+        if len(multi_result) == 0:
+            output_data[host_name] = {"error": "No result returned for host."}
+            continue
+        result = multi_result[0]
+        if result.failed:
+            detail = str(result.exception) if result.exception else str(result.result)
+            output_data[host_name] = {"error": detail}
+        else:
+            output_data[host_name] = {"output": result.result}
+    return json.dumps(output_data, indent=2, default=str)
+
 @mcp.tool()
 def get_inventory(filter_criteria: Optional[dict[str, Any]] = None) -> str:
     """
     Get inventory hosts and their metadata, optionally filtered.
-    
+
     Args:
         filter_criteria: Dictionary of key-value pairs to filter hosts (e.g. {"name": "router1"} or {"role": "core", "site": "tokyo"}).
                          Matches host attributes or data fields.
@@ -54,7 +80,7 @@ def get_inventory(filter_criteria: Optional[dict[str, Any]] = None) -> str:
 def run_netmiko_command(command: str, filter_criteria: Optional[dict[str, Any]] = None, use_textfsm: bool = False) -> str:
     """
     Run a show command concurrently on multiple hosts via Netmiko.
-    
+
     Args:
         command: The CLI command to execute (e.g., 'show version').
         filter_criteria: Dictionary of key-value pairs to filter target hosts. If empty, runs on ALL hosts!
@@ -64,62 +90,55 @@ def run_netmiko_command(command: str, filter_criteria: Optional[dict[str, Any]] 
         nr = _get_nornir(filter_criteria)
         if not nr.inventory.hosts:
             return "No hosts matched the filter criteria."
-        
-        # Run the task
-        agg_result = nr.run(
-            task=netmiko_send_command,
-            command_string=command,
-            use_textfsm=use_textfsm
-        )
-        
-        # Parse the output
-        output_data = {}
-        for host_name, multi_result in agg_result.items():
-            result = multi_result[0]
-            if result.failed:
-                output_data[host_name] = {"error": str(result.exception)}
-            else:
-                output_data[host_name] = {"output": result.result}
-                
-        return json.dumps(output_data, indent=2)
+
+        try:
+            agg_result = nr.run(
+                task=netmiko_send_command,
+                command_string=command,
+                use_textfsm=use_textfsm
+            )
+            return _format_agg_result(agg_result)
+        finally:
+            nr.close_connections()
     except Exception as e:
         logger.exception(f"Error executing command (command={command!r}, filter={filter_criteria})")
         return f"Error executing command: {str(e)}"
 
-def custom_http_task(task: Task, method: str, path: str, json_data: Optional[dict] = None) -> Result:
-    """Custom Nornir task to execute HTTP requests."""
+def _get_tls_verify(host: Any) -> bool:
+    return bool(host.data.get("tls_verify", True))
+
+def custom_http_task(task: Task, clients: dict[bool, httpx.Client], method: str, path: str, json_data: Optional[dict] = None) -> Result:
+    """Custom Nornir task to execute HTTP requests using shared clients."""
     # Build base URL from host attributes
     host = task.host
     base_url = host.data.get("base_url", f"https://{host.hostname}")
     headers = host.data.get("http_headers", {})
-    verify = host.data.get("tls_verify", True)
+    verify = _get_tls_verify(host)
     if not verify:
         logger.warning(f"TLS verification disabled for host {host.name}")
 
     url = f"{base_url.rstrip('/')}/{path.lstrip('/')}"
 
-    with httpx.Client(verify=verify) as client:
-        response = client.request(
-            method=method,
-            url=url,
-            headers=headers,
-            json=json_data,
-            timeout=10.0
-        )
-        response.raise_for_status()
-        
-        try:
-            result = response.json()
-        except ValueError:
-            result = response.text
-            
+    response = clients[verify].request(
+        method=method,
+        url=url,
+        headers=headers,
+        json=json_data
+    )
+    response.raise_for_status()
+
+    try:
+        result = response.json()
+    except ValueError:
+        result = response.text
+
     return Result(host=task.host, result=result)
 
 @mcp.tool()
 def run_http_request(method: str, path: str, filter_criteria: Optional[dict[str, Any]] = None, json_data: Optional[dict] = None) -> str:
     """
     Run an HTTP API request (REST) concurrently on multiple hosts.
-    
+
     Args:
         method: HTTP method (e.g., 'GET', 'POST', 'PUT').
         path: API path to request (e.g., '/api/v1/system').
@@ -130,26 +149,38 @@ def run_http_request(method: str, path: str, filter_criteria: Optional[dict[str,
         nr = _get_nornir(filter_criteria)
         if not nr.inventory.hosts:
             return "No hosts matched the filter criteria."
-        
-        agg_result = nr.run(
-            task=custom_http_task,
-            method=method,
-            path=path,
-            json_data=json_data
-        )
-        
-        output_data = {}
-        for host_name, multi_result in agg_result.items():
-            result = multi_result[0]
-            if result.failed:
-                output_data[host_name] = {"error": str(result.exception)}
-            else:
-                output_data[host_name] = {"output": result.result}
-                
-        return json.dumps(output_data, indent=2)
+
+        # Shared clients (one per verify setting) are created before threads start,
+        # so tasks reuse connection pools instead of handshaking per request.
+        verify_values = {_get_tls_verify(host) for host in nr.inventory.hosts.values()}
+        clients = {verify: httpx.Client(verify=verify, timeout=HTTP_TIMEOUT) for verify in verify_values}
+        try:
+            agg_result = nr.run(
+                task=custom_http_task,
+                clients=clients,
+                method=method,
+                path=path,
+                json_data=json_data
+            )
+            return _format_agg_result(agg_result)
+        finally:
+            for client in clients.values():
+                client.close()
+            nr.close_connections()
     except Exception as e:
         logger.exception(f"Error executing HTTP request (method={method}, path={path}, filter={filter_criteria})")
         return f"Error executing HTTP request: {str(e)}"
+
+def _resolve_serial_device_type(serial_settings: dict[str, Any], platform: Optional[str]) -> str:
+    """Netmiko selects its serial drivers by a device_type ending in '_serial'."""
+    device_type = serial_settings.get("device_type") or platform
+    if not device_type:
+        raise ValueError(
+            "Cannot determine serial device_type: set 'device_type' in serial_settings or 'platform' on the host."
+        )
+    if not device_type.endswith(SERIAL_DEVICE_TYPE_SUFFIX):
+        device_type = f"{device_type}{SERIAL_DEVICE_TYPE_SUFFIX}"
+    return device_type
 
 def custom_serial_task(task: Task, command: str) -> Result:
     """Custom Nornir task to execute commands via Serial port using Netmiko."""
@@ -157,60 +188,66 @@ def custom_serial_task(task: Task, command: str) -> Result:
     serial_settings = host.data.get("serial_settings")
     if not serial_settings:
         raise ValueError("No 'serial_settings' found in host data.")
-    
-    # Merge platform if not in serial_settings
-    device_type = serial_settings.get("device_type", host.platform or "autodetect")
-    
+
+    device_type = _resolve_serial_device_type(serial_settings, host.platform)
+    # 'device_type' is Netmiko metadata; the rest goes straight to pyserial.
+    pyserial_settings = {key: value for key, value in serial_settings.items() if key != "device_type"}
+
     connection_params = {
         "device_type": device_type,
-        "serial_settings": serial_settings
+        "serial_settings": pyserial_settings,
+        "username": host.username,
+        "password": host.password,
     }
-    
+
     # Instantiate ConnectHandler directly for serial
     with ConnectHandler(**connection_params) as net_connect:
         output = net_connect.send_command(command)
-        
+
     return Result(host=task.host, result=output)
 
 @mcp.tool()
 def run_serial_command(command: str, filter_criteria: Optional[dict[str, Any]] = None) -> str:
     """
     Run a CLI command on devices via direct Serial connection (using Netmiko).
-    
-    Note: Physical serial ports generally cannot be used concurrently by multiple threads.
-    Ensure your filter_criteria targets a single host, or multiple hosts on different serial ports.
-    
+
+    Note: Physical serial ports generally cannot be used concurrently by multiple threads,
+    so hosts are processed sequentially (one at a time).
+
     Args:
         command: The CLI command to execute (e.g., 'show version').
         filter_criteria: Dictionary to filter target hosts.
     """
     try:
-        nr = _get_nornir(filter_criteria)
+        nr = _get_nornir(filter_criteria, num_workers=1)
         if not nr.inventory.hosts:
             return "No hosts matched the filter criteria."
-        
-        agg_result = nr.run(
-            task=custom_serial_task,
-            command=command
-        )
-        
-        output_data = {}
-        for host_name, multi_result in agg_result.items():
-            result = multi_result[0]
-            if result.failed:
-                output_data[host_name] = {"error": str(result.exception)}
-            else:
-                output_data[host_name] = {"output": result.result}
-                
-        return json.dumps(output_data, indent=2)
+
+        try:
+            agg_result = nr.run(
+                task=custom_serial_task,
+                command=command
+            )
+            return _format_agg_result(agg_result)
+        finally:
+            nr.close_connections()
     except Exception as e:
         logger.exception(f"Error executing serial command (command={command!r}, filter={filter_criteria})")
         return f"Error executing serial command: {str(e)}"
 
 def custom_template_task(task: Task, template_string: str) -> Result:
     """Custom Nornir task to render Jinja2 templates using host inventory data."""
-    template = Template(template_string)
-    rendered = template.render(host=task.host)
+    host = task.host
+    template = _JINJA_ENV.from_string(template_string)
+    # Expose only non-sensitive host fields; credentials stay out of template reach.
+    safe_host = {
+        "name": host.name,
+        "hostname": host.hostname,
+        "platform": host.platform,
+        "groups": [g.name for g in host.groups],
+        "data": dict(host.data),
+    }
+    rendered = template.render(host=safe_host)
     return Result(host=task.host, result=rendered)
 
 @mcp.tool()
@@ -218,38 +255,37 @@ def generate_config(template_string: str, filter_criteria: Optional[dict[str, An
     """
     Generate configuration from a Jinja2 template string for each target host.
     Does NOT deploy the configuration; useful for dry-runs and auditing.
-    
+
     Args:
-        template_string: Jinja2 template string. Variables like {{ host.name }}, {{ host.hostname }}, {{ host.data['key'] }} can be used.
+        template_string: Jinja2 template string. Available variables: {{ host.name }}, {{ host.hostname }},
+                         {{ host.platform }}, {{ host.groups }}, {{ host.data['key'] }}. Other host
+                         attributes (e.g. credentials) are not exposed.
         filter_criteria: Dictionary to filter target hosts.
     """
     try:
         nr = _get_nornir(filter_criteria)
         if not nr.inventory.hosts:
             return "No hosts matched the filter criteria."
-            
-        agg_result = nr.run(
-            task=custom_template_task,
-            template_string=template_string
-        )
-        
-        output_data = {}
-        for host_name, multi_result in agg_result.items():
-            result = multi_result[0]
-            if result.failed:
-                output_data[host_name] = {"error": str(result.exception)}
-            else:
-                output_data[host_name] = {"output": result.result}
-                
-        return json.dumps(output_data, indent=2)
+
+        try:
+            agg_result = nr.run(
+                task=custom_template_task,
+                template_string=template_string
+            )
+            return _format_agg_result(agg_result)
+        finally:
+            nr.close_connections()
     except Exception as e:
+        logger.exception(f"Error generating config (filter={filter_criteria})")
         return f"Error generating config: {str(e)}"
 
 @mcp.tool()
 def run_netmiko_config(commands: list[str], filter_criteria: Optional[dict[str, Any]] = None) -> str:
     """
+    WRITE OPERATION: modifies device configuration.
     Deploy configuration commands concurrently to multiple hosts via Netmiko.
-    
+    Confirm with the user before calling this tool.
+
     Args:
         commands: List of configuration commands to execute.
         filter_criteria: Dictionary to filter target hosts.
@@ -258,22 +294,17 @@ def run_netmiko_config(commands: list[str], filter_criteria: Optional[dict[str, 
         nr = _get_nornir(filter_criteria)
         if not nr.inventory.hosts:
             return "No hosts matched the filter criteria."
-            
-        agg_result = nr.run(
-            task=netmiko_send_config,
-            config_commands=commands
-        )
-        
-        output_data = {}
-        for host_name, multi_result in agg_result.items():
-            result = multi_result[0]
-            if result.failed:
-                output_data[host_name] = {"error": str(result.exception)}
-            else:
-                output_data[host_name] = {"output": result.result}
-                
-        return json.dumps(output_data, indent=2)
+
+        try:
+            agg_result = nr.run(
+                task=netmiko_send_config,
+                config_commands=commands
+            )
+            return _format_agg_result(agg_result)
+        finally:
+            nr.close_connections()
     except Exception as e:
+        logger.exception(f"Error executing config commands (filter={filter_criteria})")
         return f"Error executing config commands: {str(e)}"
 
 if __name__ == "__main__":

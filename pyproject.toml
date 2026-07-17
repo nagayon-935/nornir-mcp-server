@@ -11,3 +11,12 @@ dependencies = [
     "nornir-netbox>=0.3.0",
     "nornir-netmiko>=1.0.1",
 ]
+
+[dependency-groups]
+dev = [
+    "pytest>=8",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
