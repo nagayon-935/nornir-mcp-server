@@ -2,9 +2,10 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import httpx
+from jinja2 import Template
 from jinja2.sandbox import SandboxedEnvironment
 from mcp.server.fastmcp import FastMCP
 from netmiko import ConnectHandler
@@ -18,15 +19,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("nornir-mcp-server")
 
 CONFIG_FILE = Path(os.environ.get("NORNIR_MCP_CONFIG", str(Path(__file__).parent / "config.yaml")))
+# Default per-request HTTP timeout; override per host with 'http_timeout' in host.data.
 HTTP_TIMEOUT = 10.0
 SERIAL_DEVICE_TYPE_SUFFIX = "_serial"
 
-mcp = FastMCP("nornir server", dependencies=["nornir", "nornir-netmiko"])
+# Mirrors the direct imports above (and pyproject.toml): `mcp install` builds its
+# isolated environment from this list, so a missing entry breaks that path at import.
+mcp = FastMCP(
+    "nornir server",
+    dependencies=["httpx", "jinja2", "netmiko", "nornir", "nornir-netbox", "nornir-netmiko"],
+)
 
 # Jinja2 environments are thread-safe and shareable across renders.
 _JINJA_ENV = SandboxedEnvironment()
 
-def _get_nornir(filter_criteria: Optional[dict[str, Any]] = None, num_workers: Optional[int] = None) -> Nornir:
+def _get_nornir(filter_criteria: dict[str, Any] | None = None, num_workers: int | None = None) -> Nornir:
     """Initialize Nornir and apply filtering if provided."""
     kwargs: dict[str, Any] = {}
     if num_workers is not None:
@@ -53,12 +60,13 @@ def _format_agg_result(agg_result: AggregatedResult) -> str:
     return json.dumps(output_data, indent=2, default=str)
 
 @mcp.tool()
-def get_inventory(filter_criteria: Optional[dict[str, Any]] = None) -> str:
+def get_inventory(filter_criteria: dict[str, Any] | None = None) -> str:
     """
     Get inventory hosts and their metadata, optionally filtered.
 
     Args:
-        filter_criteria: Dictionary of key-value pairs to filter hosts (e.g. {"name": "router1"} or {"role": "core", "site": "tokyo"}).
+        filter_criteria: Dictionary of key-value pairs to filter hosts
+                         (e.g. {"name": "router1"} or {"role": "core", "site": "tokyo"}).
                          Matches host attributes or data fields.
     """
     try:
@@ -77,7 +85,7 @@ def get_inventory(filter_criteria: Optional[dict[str, Any]] = None) -> str:
         return f"Error loading inventory: {str(e)}"
 
 @mcp.tool()
-def run_netmiko_command(command: str, filter_criteria: Optional[dict[str, Any]] = None, use_textfsm: bool = False) -> str:
+def run_netmiko_command(command: str, filter_criteria: dict[str, Any] | None = None, use_textfsm: bool = False) -> str:
     """
     Run a show command concurrently on multiple hosts via Netmiko.
 
@@ -107,7 +115,17 @@ def run_netmiko_command(command: str, filter_criteria: Optional[dict[str, Any]] 
 def _get_tls_verify(host: Any) -> bool:
     return bool(host.data.get("tls_verify", True))
 
-def custom_http_task(task: Task, clients: dict[bool, httpx.Client], method: str, path: str, json_data: Optional[dict] = None) -> Result:
+def _get_http_timeout(host: Any) -> float:
+    """Per-host request timeout; falls back to HTTP_TIMEOUT when unset."""
+    return float(host.data.get("http_timeout", HTTP_TIMEOUT))
+
+def custom_http_task(
+    task: Task,
+    clients: dict[bool, httpx.Client],
+    method: str,
+    path: str,
+    json_data: dict | None = None,
+) -> Result:
     """Custom Nornir task to execute HTTP requests using shared clients."""
     # Build base URL from host attributes
     host = task.host
@@ -123,7 +141,8 @@ def custom_http_task(task: Task, clients: dict[bool, httpx.Client], method: str,
         method=method,
         url=url,
         headers=headers,
-        json=json_data
+        json=json_data,
+        timeout=_get_http_timeout(host)
     )
     response.raise_for_status()
 
@@ -135,7 +154,12 @@ def custom_http_task(task: Task, clients: dict[bool, httpx.Client], method: str,
     return Result(host=task.host, result=result)
 
 @mcp.tool()
-def run_http_request(method: str, path: str, filter_criteria: Optional[dict[str, Any]] = None, json_data: Optional[dict] = None) -> str:
+def run_http_request(
+    method: str,
+    path: str,
+    filter_criteria: dict[str, Any] | None = None,
+    json_data: dict | None = None,
+) -> str:
     """
     Run an HTTP API request (REST) concurrently on multiple hosts.
 
@@ -144,6 +168,9 @@ def run_http_request(method: str, path: str, filter_criteria: Optional[dict[str,
         path: API path to request (e.g., '/api/v1/system').
         filter_criteria: Dictionary to filter target hosts.
         json_data: Optional JSON payload for POST/PUT requests.
+
+    Per-host settings come from the inventory's host data: 'base_url', 'http_headers',
+    'tls_verify', and 'http_timeout' (seconds, defaults to 10).
     """
     try:
         nr = _get_nornir(filter_criteria)
@@ -171,7 +198,7 @@ def run_http_request(method: str, path: str, filter_criteria: Optional[dict[str,
         logger.exception(f"Error executing HTTP request (method={method}, path={path}, filter={filter_criteria})")
         return f"Error executing HTTP request: {str(e)}"
 
-def _resolve_serial_device_type(serial_settings: dict[str, Any], platform: Optional[str]) -> str:
+def _resolve_serial_device_type(serial_settings: dict[str, Any], platform: str | None) -> str:
     """Netmiko selects its serial drivers by a device_type ending in '_serial'."""
     device_type = serial_settings.get("device_type") or platform
     if not device_type:
@@ -207,7 +234,7 @@ def custom_serial_task(task: Task, command: str) -> Result:
     return Result(host=task.host, result=output)
 
 @mcp.tool()
-def run_serial_command(command: str, filter_criteria: Optional[dict[str, Any]] = None) -> str:
+def run_serial_command(command: str, filter_criteria: dict[str, Any] | None = None) -> str:
     """
     Run a CLI command on devices via direct Serial connection (using Netmiko).
 
@@ -235,10 +262,14 @@ def run_serial_command(command: str, filter_criteria: Optional[dict[str, Any]] =
         logger.exception(f"Error executing serial command (command={command!r}, filter={filter_criteria})")
         return f"Error executing serial command: {str(e)}"
 
-def custom_template_task(task: Task, template_string: str) -> Result:
-    """Custom Nornir task to render Jinja2 templates using host inventory data."""
+def custom_template_task(task: Task, template: Template) -> Result:
+    """Custom Nornir task to render a precompiled Jinja2 template using host inventory data.
+
+    The template MUST come from `_JINJA_ENV` (the module-level SandboxedEnvironment).
+    The annotation cannot express that: a plain `jinja2.Template` would render here just
+    as well, with the sandbox silently gone.
+    """
     host = task.host
-    template = _JINJA_ENV.from_string(template_string)
     # Expose only non-sensitive host fields; credentials stay out of template reach.
     safe_host = {
         "name": host.name,
@@ -251,7 +282,7 @@ def custom_template_task(task: Task, template_string: str) -> Result:
     return Result(host=task.host, result=rendered)
 
 @mcp.tool()
-def generate_config(template_string: str, filter_criteria: Optional[dict[str, Any]] = None) -> str:
+def generate_config(template_string: str, filter_criteria: dict[str, Any] | None = None) -> str:
     """
     Generate configuration from a Jinja2 template string for each target host.
     Does NOT deploy the configuration; useful for dry-runs and auditing.
@@ -267,10 +298,13 @@ def generate_config(template_string: str, filter_criteria: Optional[dict[str, An
         if not nr.inventory.hosts:
             return "No hosts matched the filter criteria."
 
+        # Compile once up front; from_string() has no cache, so compiling inside the
+        # task would re-parse the same template for every host in the thread pool.
+        template = _JINJA_ENV.from_string(template_string)
         try:
             agg_result = nr.run(
                 task=custom_template_task,
-                template_string=template_string
+                template=template
             )
             return _format_agg_result(agg_result)
         finally:
@@ -280,7 +314,7 @@ def generate_config(template_string: str, filter_criteria: Optional[dict[str, An
         return f"Error generating config: {str(e)}"
 
 @mcp.tool()
-def run_netmiko_config(commands: list[str], filter_criteria: Optional[dict[str, Any]] = None) -> str:
+def run_netmiko_config(commands: list[str], filter_criteria: dict[str, Any] | None = None) -> str:
     """
     WRITE OPERATION: modifies device configuration.
     Deploy configuration commands concurrently to multiple hosts via Netmiko.

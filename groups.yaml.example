@@ -1,12 +1,17 @@
 ---
 ios_devices:
   platform: cisco_ios
+  # Top-level credentials. Required by run_serial_command, which reads
+  # host.username / host.password directly (connection_options only feeds SSH).
+  username: "CHANGE_ME"
+  password: "CHANGE_ME"
   connection_options:
     netmiko:
       extras:
-        username: "admin"
-        password: "password"
-        # secret: "enablepass"
+        # SSH/Telnet credentials (run_netmiko_command / run_netmiko_config).
+        username: "CHANGE_ME"
+        password: "CHANGE_ME"
+        # secret: "CHANGE_ME"  # enable password
 
 tokyo:
   data:

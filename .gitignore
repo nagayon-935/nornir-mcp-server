@@ -12,6 +12,7 @@ wheels/
 # Local inventory (contains device credentials - never commit)
 hosts.yaml
 groups.yaml
+defaults.yaml
 
 # Logs
 *.log

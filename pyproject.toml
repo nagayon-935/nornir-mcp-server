@@ -5,8 +5,12 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+    # httpx and netmiko are imported directly by server.py, so they are declared
+    # explicitly rather than relied on transitively via mcp[cli] / nornir-netmiko.
+    "httpx>=0.28.1",
     "jinja2>=3.1.6",
     "mcp[cli]>=1.28.1",
+    "netmiko>=4.7.0",
     "nornir>=3.5.0",
     "nornir-netbox>=0.3.0",
     "nornir-netmiko>=1.0.1",
@@ -15,8 +19,17 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=8",
+    "ruff>=0.14.0",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+# E/W: pycodestyle, F: pyflakes, I: isort (import sorting), UP: pyupgrade, B: bugbear
+select = ["E", "W", "F", "I", "UP", "B"]

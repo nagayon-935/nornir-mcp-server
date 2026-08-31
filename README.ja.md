@@ -41,14 +41,16 @@ uv sync
 export NORNIR_MCP_CONFIG=/path/to/config.yaml
 ```
 
-`hosts.yaml` / `groups.yaml` は機器の認証情報を含むため `.gitignore` 対象です。テンプレートからコピーして作成してください。
+この方法で解決されるのは設定ファイル自身のパスだけです。設定ファイル**内**の `host_file` / `group_file` は Nornir がプロセスのカレントディレクトリを基準に解決するため、リポジトリ外に設定ファイルを置く場合はインベントリのパスを絶対パスで指定してください。
+
+`hosts.yaml` / `groups.yaml` / `defaults.yaml` は機器の認証情報を含むため `.gitignore` 対象です。テンプレートからコピーして作成してください。
 
 ```bash
 cp hosts.yaml.example hosts.yaml
 cp groups.yaml.example groups.yaml
 ```
 
-`groups.yaml` を編集し、`CHANGE_ME` を実際のログイン情報に置き換えてください。このファイルはコミットされません。
+`groups.yaml` を編集し、すべての `CHANGE_ME` を実際のログイン情報に置き換えてください。トップレベルの `username` / `password`（`run_serial_command` が使用）と、`connection_options.netmiko.extras` 配下（SSH/Telnet が使用）の両方が対象です。これらのファイルはコミットされません。
 
 **`config.yaml` (SimpleInventoryの例):**
 ```yaml
@@ -63,13 +65,19 @@ logging:
 ```
 
 **`config.yaml` (NetBox連携の例):**
+
+⚠️ インベントリファイルとは異なり、`config.yaml` は **git の管理対象** です。NetBox の API トークンを直接書き込まないでください。`NetBoxInventory2` はトークンを環境変数 `NB_TOKEN` から（URL を `NB_URL` から）読み込みます。
+
+```bash
+export NB_TOKEN=your-netbox-api-token
+```
+
 ```yaml
 ---
 inventory:
-  plugin: NBInventory
+  plugin: NetBoxInventory2
   options:
     nb_url: "https://netbox.local"
-    nb_token: "YOUR_NETBOX_API_TOKEN"
 logging:
   enabled: False
 ```
@@ -116,13 +124,14 @@ docker run -i --rm \
 ### `run_http_request`
 フィルタリングされた対象機器群の REST API エンドポイントに HTTP リクエストを実行します。
 * **引数**: `method` (GET/POST等), `path` (APIパス), `filter_criteria`, `json_data`
-* 対象ホストのインベントリデータ (`host.data`) に `base_url` (例: `https://192.168.1.1`), `http_headers`, `tls_verify` (True/False) 等の情報を記載して利用します。
+* 対象ホストのインベントリデータ (`host.data`) に `base_url` (例: `https://192.168.1.1`), `http_headers`, `tls_verify` (True/False), `http_timeout` (秒数、既定は 10) 等の情報を記載して利用します。
 
 ### `run_serial_command`
 直接シリアル接続（コンソールケーブル等）を用いてコマンドを実行します。物理ポートは同時に1つのプロセスからしか使えないため、対象が複数ホストでも常に1台ずつ順番に処理されます（並列実行しません）。
 * **引数**: `command` (実行するコマンド), `filter_criteria`
 * 対象ホストのインベントリデータに `serial_settings` (port, baudrate 等) の記載が必要です。Netmiko のシリアルドライバは `device_type` の末尾が `_serial` である必要があるため、`serial_settings.device_type` を明示するか、未指定の場合は `host.platform`（例: `cisco_ios`）に自動で `_serial` を付与します。
-* ログイン認証には `hosts.yaml` / `groups.yaml` / `defaults.yaml` の**トップレベル**の `username` / `password` を使用します。`connection_options.netmiko.extras` 配下の値（SSH接続用）は参照しないため、シリアル接続も使う場合はトップレベルにも認証情報を設定してください。
+* この自動付与は Netmiko のドライバ一覧と照合されません。Netmiko がシリアルドライバを提供しているプラットフォームは一部のみのため、対応するドライバが無い場合（例: `arista_eos` → `arista_eos_serial`）は `Unsupported device_type` で失敗します。その場合は `serial_settings.device_type` を明示してください。
+* ログイン認証には `hosts.yaml` / `groups.yaml` / `defaults.yaml` の**トップレベル**の `username` / `password` を使用します。`connection_options.netmiko.extras` 配下の値（SSH接続用）は参照しないため、シリアル接続も使う場合はトップレベルにも認証情報を設定してください（`groups.yaml.example` には両方を記載済みです）。これら3ファイルはいずれも `.gitignore` 対象です。
 
 ### `generate_config`
 Jinja2 テンプレート（サンドボックス環境で実行）を用いて、コンフィグを動的生成します。（実機への適用は行いません）
@@ -132,6 +141,7 @@ Jinja2 テンプレート（サンドボックス環境で実行）を用いて�
 ### `run_netmiko_config`
 ⚠️ **実機の設定を変更する破壊的な操作です。** 生成したコンフィグや指定のコマンドリストを、対象機器に並列で設定投入 (Config Deploy) します。
 * **引数**: `commands` (投入する設定コマンドのリスト), `filter_criteria`
+* 本サーバー唯一の書き込み経路です。ツールの説明文で「実行前にユーザーへ確認すること」をエージェントに指示しています。このツールについては必ず人間の承認を挟んでください。
 
 ## テスト
 
