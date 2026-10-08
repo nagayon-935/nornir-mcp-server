@@ -1,9 +1,12 @@
 import json
+from datetime import date
 from types import SimpleNamespace
 
 import pytest
-from nornir.core.inventory import Host
+from nornir.core import Nornir
+from nornir.core.inventory import Defaults, Group, Host, Inventory, ParentGroups
 from nornir.core.task import AggregatedResult, MultiResult, Result
+from nornir.plugins.runners import SerialRunner
 
 import server
 from server import (
@@ -26,9 +29,9 @@ from server import (
 NO_MATCH_MESSAGE = "No hosts matched the filter criteria."
 
 
-def _fake_host(**data) -> SimpleNamespace:
-    """Minimal host stub: run_http_request reads host.data before dispatching."""
-    return SimpleNamespace(name="router1", hostname="192.168.1.1", data=data)
+def _fake_host(**data) -> Host:
+    """Build a real inventory host without opening device connections."""
+    return Host(name="router1", hostname="192.168.1.1", data=data)
 
 
 def _build_agg_result(result: Result) -> AggregatedResult:
@@ -47,7 +50,15 @@ class FakeNornir:
         self.agg_result = agg_result
         self.run_error = run_error
         self.closed = False
+        self.closed_failed_hosts = False
         self.run_calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.close_connections(on_failed=True)
+        return False
 
     def run(self, task, **kwargs):
         self.run_calls.append((task, kwargs))
@@ -55,8 +66,9 @@ class FakeNornir:
             raise self.run_error
         return self.agg_result
 
-    def close_connections(self):
+    def close_connections(self, on_failed=False):
         self.closed = True
+        self.closed_failed_hosts = on_failed
 
 
 @pytest.fixture
@@ -82,9 +94,7 @@ CONNECTION_TOOLS = [
     pytest.param(run_netmiko_command, {"command": "show version"}, id="run_netmiko_command"),
     pytest.param(run_http_request, {"method": "GET", "path": "/api"}, id="run_http_request"),
     pytest.param(run_serial_command, {"command": "show version"}, id="run_serial_command"),
-    pytest.param(
-        generate_config, {"template_string": "hostname {{ host.name }}"}, id="generate_config"
-    ),
+    pytest.param(generate_config, {"template_string": "hostname {{ host.name }}"}, id="generate_config"),
     pytest.param(run_netmiko_config, {"commands": ["hostname r1"]}, id="run_netmiko_config"),
 ]
 
@@ -98,18 +108,14 @@ class TestFormatAggResult:
         assert output == {"router1": {"output": "Cisco IOS XE"}}
 
     def test_returns_exception_message_for_failed_result(self):
-        agg_result = _build_agg_result(
-            Result(host=None, failed=True, exception=ValueError("connection refused"))
-        )
+        agg_result = _build_agg_result(Result(host=None, failed=True, exception=ValueError("connection refused")))
 
         output = json.loads(_format_agg_result(agg_result))
 
         assert output == {"router1": {"error": "connection refused"}}
 
     def test_falls_back_to_result_text_when_failed_without_exception(self):
-        agg_result = _build_agg_result(
-            Result(host=None, failed=True, result="Traceback: something went wrong")
-        )
+        agg_result = _build_agg_result(Result(host=None, failed=True, result="Traceback: something went wrong"))
 
         output = json.loads(_format_agg_result(agg_result))
 
@@ -130,12 +136,16 @@ class TestFormatAggResult:
 
         assert output["router1"]["output"]["uptime"] == str(complex(1, 2))
 
+    def test_reports_subtask_failure_even_when_parent_result_succeeded(self):
+        agg_result = _build_agg_result(Result(host=None, result="parent output"))
+        agg_result["router1"].append(Result(host=None, failed=True, exception=ValueError("subtask failed")))
+
+        assert json.loads(_format_agg_result(agg_result)) == {"router1": {"error": "subtask failed"}}
+
 
 class TestResolveSerialDeviceType:
     def test_prefers_explicit_device_type_in_serial_settings(self):
-        device_type = _resolve_serial_device_type(
-            {"device_type": "cisco_ios_serial"}, platform="cisco_xr"
-        )
+        device_type = _resolve_serial_device_type({"device_type": "cisco_ios_serial"}, platform="cisco_xr")
 
         assert device_type == "cisco_ios_serial"
 
@@ -156,16 +166,16 @@ class TestResolveSerialDeviceType:
 
 class TestHostHttpSettings:
     def test_tls_verify_defaults_to_enabled(self):
-        assert _get_tls_verify(SimpleNamespace(data={})) is True
+        assert _get_tls_verify(_fake_host()) is True
 
     def test_tls_verify_can_be_disabled(self):
-        assert _get_tls_verify(SimpleNamespace(data={"tls_verify": False})) is False
+        assert _get_tls_verify(_fake_host(tls_verify=False)) is False
 
     def test_http_timeout_defaults_to_module_constant(self):
-        assert _get_http_timeout(SimpleNamespace(data={})) == server.HTTP_TIMEOUT
+        assert _get_http_timeout(_fake_host()) == server.HTTP_TIMEOUT
 
     def test_http_timeout_is_overridable_per_host(self):
-        assert _get_http_timeout(SimpleNamespace(data={"http_timeout": 45})) == 45.0
+        assert _get_http_timeout(_fake_host(http_timeout=45)) == 45.0
 
 
 class TestCustomTemplateTask:
@@ -182,9 +192,7 @@ class TestCustomTemplateTask:
 
     def test_renders_allowed_host_fields(self):
         task = self._build_task()
-        template = _JINJA_ENV.from_string(
-            "hostname {{ host.name }} ! {{ host.hostname }} {{ host.data['role'] }}"
-        )
+        template = _JINJA_ENV.from_string("hostname {{ host.name }} ! {{ host.hostname }} {{ host.data['role'] }}")
 
         result = custom_template_task(task, template)
 
@@ -226,11 +234,9 @@ class FakeClient:
 
 class TestCustomHttpTask:
     def _run(self, data, response, method="GET", path="/api/v1/system"):
-        host = SimpleNamespace(name="router1", hostname="192.168.1.1", data=data)
+        host = _fake_host(**data)
         client = FakeClient(response)
-        result = custom_http_task(
-            SimpleNamespace(host=host), {True: client, False: client}, method, path
-        )
+        result = custom_http_task(SimpleNamespace(host=host), {True: client, False: client}, method, path)
         return result, client.requests[0]
 
     def test_defaults_base_url_to_https_hostname(self):
@@ -318,9 +324,7 @@ class TestCustomSerialTask:
         assert connect_handler.instances[0].params["device_type"] == "cisco_ios_serial"
 
     def test_strips_device_type_from_pyserial_settings(self, connect_handler):
-        task = self._build_task(
-            data={"serial_settings": {"port": "/dev/ttyUSB0", "device_type": "cisco_ios_serial"}}
-        )
+        task = self._build_task(data={"serial_settings": {"port": "/dev/ttyUSB0", "device_type": "cisco_ios_serial"}})
 
         custom_serial_task(task, "show version")
 
@@ -346,6 +350,7 @@ class TestNoHostsShortCircuit:
 
         assert tool(**kwargs) == NO_MATCH_MESSAGE
         assert nr.run_calls == []
+        assert nr.closed is True
 
     def test_get_inventory_returns_empty_mapping(self, patched_nornir):
         patched_nornir(FakeNornir(hosts={}))
@@ -363,14 +368,11 @@ class TestConnectionCleanup:
 
         assert json.loads(tool(**kwargs)) == {"router1": {"output": "ok"}}
         assert nr.closed is True
+        assert nr.closed_failed_hosts is True
 
     @pytest.mark.parametrize("tool,kwargs", CONNECTION_TOOLS)
-    def test_closes_connections_and_reports_error_when_run_raises(
-        self, patched_nornir, tool, kwargs
-    ):
-        nr = patched_nornir(
-            FakeNornir(hosts={"router1": _fake_host()}, run_error=RuntimeError("boom"))
-        )
+    def test_closes_connections_and_reports_error_when_run_raises(self, patched_nornir, tool, kwargs):
+        nr = patched_nornir(FakeNornir(hosts={"router1": _fake_host()}, run_error=RuntimeError("boom")))
 
         output = tool(**kwargs)
 
@@ -403,9 +405,7 @@ class TestToolRunnerArguments:
 
         assert patched_nornir.calls[-1]["num_workers"] is None
 
-    def test_generate_config_compiles_template_once_for_all_hosts(
-        self, patched_nornir, monkeypatch
-    ):
+    def test_generate_config_compiles_template_once_for_all_hosts(self, patched_nornir, monkeypatch):
         compiled = []
         original_from_string = _JINJA_ENV.from_string
 
@@ -415,9 +415,7 @@ class TestToolRunnerArguments:
 
         monkeypatch.setattr(_JINJA_ENV, "from_string", counting_from_string)
         agg_result = _build_agg_result(Result(host=None, result="ok"))
-        nr = patched_nornir(
-            FakeNornir(hosts={"r1": _fake_host(), "r2": _fake_host()}, agg_result=agg_result)
-        )
+        nr = patched_nornir(FakeNornir(hosts={"r1": _fake_host(), "r2": _fake_host()}, agg_result=agg_result))
 
         generate_config("hostname {{ host.name }}")
 
@@ -436,6 +434,7 @@ class TestToolRunnerArguments:
 
         assert output.startswith("Error generating config:")
         assert nr.run_calls == []
+        assert nr.closed is True
 
 
 class TestHttpClientFanOut:
@@ -451,13 +450,11 @@ class TestHttpClientFanOut:
             def close(self):
                 self.closed = True
 
-        monkeypatch.setattr(
-            server.httpx, "Client", lambda verify, timeout: RecordingClient(verify, timeout)
-        )
+        monkeypatch.setattr(server.httpx, "Client", lambda verify, timeout: RecordingClient(verify, timeout))
         hosts = {
-            "secure": SimpleNamespace(data={}),
-            "also_secure": SimpleNamespace(data={"tls_verify": True}),
-            "insecure": SimpleNamespace(data={"tls_verify": False}),
+            "secure": _fake_host(),
+            "also_secure": _fake_host(tls_verify=True),
+            "insecure": _fake_host(tls_verify=False),
         }
         agg_result = _build_agg_result(Result(host=None, result="ok"))
         patched_nornir(FakeNornir(hosts=hosts, agg_result=agg_result))
@@ -466,3 +463,174 @@ class TestHttpClientFanOut:
 
         assert sorted(client.verify for client in created) == [False, True]
         assert all(client.closed for client in created)
+
+    def test_closes_existing_clients_when_later_client_creation_fails(self, patched_nornir, monkeypatch):
+        created = []
+
+        class RecordingClient:
+            closed = False
+
+            def close(self):
+                self.closed = True
+
+        def create_client(**kwargs):
+            if created:
+                raise RuntimeError("client initialization failed")
+            client = RecordingClient()
+            created.append(client)
+            return client
+
+        monkeypatch.setattr(server.httpx, "Client", create_client)
+        nr = patched_nornir(FakeNornir(hosts={"r1": _fake_host(), "r2": _fake_host(tls_verify=False)}))
+
+        output = run_http_request("GET", "/api")
+
+        assert "client initialization failed" in output
+        assert created[0].closed is True
+        assert nr.closed is True
+        assert nr.run_calls == []
+
+    def test_closes_all_resources_even_when_a_client_close_raises(self, patched_nornir, monkeypatch):
+        created = []
+
+        class RecordingClient:
+            def __init__(self, **kwargs):
+                self.closed = False
+                created.append(self)
+
+            def close(self):
+                self.closed = True
+                raise RuntimeError("client close failed")
+
+        monkeypatch.setattr(server.httpx, "Client", RecordingClient)
+        nr = patched_nornir(
+            FakeNornir(
+                hosts={"r1": _fake_host(), "r2": _fake_host(tls_verify=False)},
+                agg_result=_build_agg_result(Result(host=None, result="ok")),
+            )
+        )
+
+        output = run_http_request("GET", "/api")
+
+        assert "client close failed" in output
+        assert all(client.closed for client in created)
+        assert nr.closed is True
+
+
+class TestInheritedHostData:
+    @pytest.fixture
+    def host(self):
+        defaults = Defaults(data={"http_timeout": 25, "region": "jp"})
+        group = Group(
+            name="tokyo",
+            defaults=defaults,
+            data={
+                "site": "tokyo",
+                "base_url": "https://group.example",
+                "http_headers": {"X-Auth": "group-token"},
+                "tls_verify": False,
+                "serial_settings": {"port": "/dev/ttyUSB0", "baudrate": 9600},
+            },
+        )
+        return Host(
+            name="router1",
+            hostname="192.168.1.1",
+            platform="cisco_ios",
+            groups=ParentGroups([group]),
+            defaults=defaults,
+            data={"role": "core"},
+        )
+
+    def test_http_request_uses_group_settings_and_default_timeout(self, host):
+        client = FakeClient(FakeResponse(payload={"ok": True}))
+
+        custom_http_task(SimpleNamespace(host=host), {False: client}, "GET", "/api")
+
+        assert client.requests[0]["url"] == "https://group.example/api"
+        assert client.requests[0]["headers"] == {"X-Auth": "group-token"}
+        assert client.requests[0]["timeout"] == 25.0
+
+    def test_http_fan_out_selects_client_using_inherited_tls_setting(self, host, patched_nornir, monkeypatch):
+        created = []
+
+        class RecordingClient:
+            def __init__(self, verify, timeout):
+                created.append(verify)
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(server.httpx, "Client", RecordingClient)
+        patched_nornir(
+            FakeNornir(hosts={host.name: host}, agg_result=_build_agg_result(Result(host=None, result="ok")))
+        )
+
+        run_http_request("GET", "/api")
+
+        assert created == [False]
+
+    def test_host_settings_override_group_and_default_settings(self, host):
+        host.data.update(tls_verify=True, http_timeout=3)
+
+        assert _get_tls_verify(host) is True
+        assert _get_http_timeout(host) == 3.0
+
+    def test_serial_request_uses_group_settings(self, host, monkeypatch):
+        FakeConnectHandler.instances = []
+        monkeypatch.setattr(server, "ConnectHandler", FakeConnectHandler)
+
+        custom_serial_task(SimpleNamespace(host=host), "show version")
+
+        assert FakeConnectHandler.instances[0].params["serial_settings"] == {"port": "/dev/ttyUSB0", "baudrate": 9600}
+
+    def test_inventory_includes_group_and_default_data(self, host, patched_nornir):
+        patched_nornir(FakeNornir(hosts={host.name: host}))
+
+        data = json.loads(get_inventory())[host.name]["data"]
+
+        assert data["site"] == "tokyo"
+        assert data["region"] == "jp"
+        assert data["role"] == "core"
+
+    def test_templates_include_group_and_default_data(self, host):
+        template = _JINJA_ENV.from_string("{{ host.data.site }} {{ host.data.region }} {{ host.data.role }}")
+
+        result = custom_template_task(SimpleNamespace(host=host), template)
+
+        assert result.result == "tokyo jp core"
+
+
+def test_inventory_serializes_yaml_date_values(patched_nornir):
+    patched_nornir(FakeNornir(hosts={"router1": _fake_host(commissioned=date(2026, 1, 1))}))
+
+    assert json.loads(get_inventory())["router1"]["data"]["commissioned"] == "2026-01-01"
+
+
+def test_failed_nornir_hosts_have_their_connections_closed(monkeypatch):
+    """Use the real Nornir runner: the fake cannot detect its failed-host exclusion."""
+    hosts = {name: Host(name=name) for name in ("healthy", "failed")}
+    closed_hosts = []
+
+    class Connection:
+        def __init__(self, name):
+            self.name = name
+
+        def close(self):
+            closed_hosts.append(self.name)
+
+    def command_task(task, **kwargs):
+        task.host.connections["netmiko"] = Connection(task.host.name)
+        if task.host.name == "failed":
+            raise RuntimeError("command failed after connecting")
+        return Result(host=task.host, result="ok")
+
+    nr = Nornir(inventory=Inventory(hosts=hosts), runner=SerialRunner())
+    monkeypatch.setattr(server, "_get_nornir", lambda *args, **kwargs: nr)
+    monkeypatch.setattr(server, "netmiko_send_command", command_task)
+
+    output = json.loads(run_netmiko_command("show version"))
+
+    assert output["healthy"] == {"output": "ok"}
+    assert output["failed"] == {"error": "command failed after connecting"}
+    assert sorted(closed_hosts) == ["failed", "healthy"]
+    assert all(not host.connections for host in hosts.values())
