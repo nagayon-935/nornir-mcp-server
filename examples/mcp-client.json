@@ -1,0 +1,18 @@
+{
+  "mcpServers": {
+    "nornir": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/absolute/path/to/nornir-mcp-server",
+        "run",
+        "mcp",
+        "run",
+        "server.py"
+      ],
+      "env": {
+        "NORNIR_MCP_CONFIG": "/absolute/path/to/config.yaml"
+      }
+    }
+  }
+}

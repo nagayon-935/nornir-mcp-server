@@ -3,10 +3,13 @@ import logging
 import os
 from collections import Counter, OrderedDict
 from contextlib import ExitStack
+from importlib.metadata import entry_points
+from math import isfinite
 from pathlib import Path
 from threading import Lock
 from time import monotonic
 from typing import Any, Literal, NotRequired, TypedDict
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -15,11 +18,15 @@ from jinja2.sandbox import SandboxedEnvironment
 from mcp.server.fastmcp import FastMCP
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
+from netmiko.ssh_dispatcher import CLASS_MAPPER
 from nornir import InitNornir
 from nornir.core import Nornir
+from nornir.core.configuration import Config
 from nornir.core.filter import F
 from nornir.core.inventory import Host
 from nornir.core.task import AggregatedResult, Result, Task
+from nornir.plugins.inventory.simple import SimpleInventory
+from nornir_netmiko.connections.netmiko import napalm_to_netmiko_map
 from nornir_netmiko.tasks import netmiko_send_command, netmiko_send_config
 
 logging.basicConfig(level=logging.INFO)
@@ -145,16 +152,356 @@ def _tool_error(
     return report
 
 
+def _inventory_paths(config: Config) -> dict[str, Path]:
+    """Normalize only the file options of known built-in inventory backends."""
+    fields = (
+        ("host_file", "group_file", "defaults_file")
+        if config.inventory.plugin == "SimpleInventory"
+        else (("group_file", "defaults_file") if config.inventory.plugin == "NetBoxInventory2" else ())
+    )
+    config_directory = CONFIG_FILE.expanduser().resolve().parent
+    default_files = {"host_file": "hosts.yaml", "group_file": "groups.yaml", "defaults_file": "defaults.yaml"}
+    paths = {}
+    for field in fields:
+        path = Path(config.inventory.options.get(field, default_files[field])).expanduser()
+        paths[field] = path if path.is_absolute() else config_directory / path
+    return paths
+
+
+def _load_config() -> Config:
+    config = Config.from_file(str(CONFIG_FILE.expanduser().resolve()))
+    config.inventory.options = {
+        **config.inventory.options,
+        **{field: str(path) for field, path in _inventory_paths(config).items()},
+    }
+    return config
+
+
 def _get_nornir(filter_criteria: dict[str, Any] | None = None, num_workers: int | None = None) -> Nornir:
-    """Initialize Nornir and apply filtering if provided."""
-    kwargs: dict[str, Any] = {}
+    """Initialize Nornir with inventory paths relative to the configuration file."""
+    kwargs = _load_config().dict()
     if num_workers is not None:
         kwargs["runner"] = {"plugin": "threaded", "options": {"num_workers": num_workers}}
-    nr = InitNornir(config_file=str(CONFIG_FILE), **kwargs)
+    nr = InitNornir(**kwargs)
     if filter_criteria:
         # F(**filter_criteria) allows matching by attributes like site, role, name, etc.
         nr = nr.filter(F(**filter_criteria))
     return nr
+
+
+class DiagnosticCheck(TypedDict):
+    status: Literal["ok", "warning", "error"]
+    code: str
+    message: str
+    hint: str
+    host: NotRequired[str]
+    field: NotRequired[str]
+
+
+class DiagnosticReport(TypedDict):
+    status: Literal["success", "warning", "failed"]
+    config_path: str
+    inventory_plugin: str | None
+    inventory_files: dict[str, str]
+    network_accessed: bool
+    hosts_checked: int | None
+    checks: list[DiagnosticCheck]
+
+
+def _diagnose_host(host: Host) -> list[DiagnosticCheck]:
+    checks: list[DiagnosticCheck] = []
+
+    def add(status: Literal["warning", "error"], code: str, field: str, message: str, hint: str) -> None:
+        checks.append(
+            {"status": status, "code": code, "host": host.name, "field": field, "message": message, "hint": hint}
+        )
+
+    params = host.get_connection_parameters("netmiko")
+    extras = params.extras or {}
+    device_type = extras.get("device_type") or napalm_to_netmiko_map.get(params.platform, params.platform)
+    if device_type and device_type not in CLASS_MAPPER:
+        add(
+            "error",
+            "unsupported_platform",
+            "platform",
+            "No Netmiko driver matches this host's SSH platform.",
+            "Use a supported Netmiko device_type in platform or connection_options.netmiko.extras.",
+        )
+    elif device_type:
+        username = extras.get("username", params.username)
+        password = extras.get("password", params.password)
+        if not username or (not password and not extras.get("use_keys") and not extras.get("allow_agent")):
+            add(
+                "warning",
+                "ssh_credentials_missing",
+                "credentials",
+                "SSH credentials are incomplete.",
+                "Configure login credentials or an SSH key/agent. Connectivity is not tested here.",
+            )
+        for field, value in {"username": username, "password": password, "secret": extras.get("secret")}.items():
+            if value == "CHANGE_ME":
+                add(
+                    "error",
+                    "placeholder_credentials",
+                    field,
+                    "A sample credential placeholder is still configured.",
+                    "Replace the placeholder in the local credential configuration.",
+                )
+    elif not host.get("serial_settings") and not host.get("base_url"):
+        add(
+            "warning",
+            "platform_missing",
+            "platform",
+            "No SSH platform or alternative connection is configured.",
+            "Set platform for SSH, base_url for HTTP, or serial_settings for serial access.",
+        )
+
+    if not host.hostname and not host.get("base_url") and not host.get("serial_settings"):
+        add("error", "address_missing", "hostname", "No connection address is configured.", "Set hostname or base_url.")
+    if not isinstance(host.get("tls_verify", True), bool):
+        add("error", "invalid_tls_setting", "tls_verify", "tls_verify must be a YAML boolean.", "Use true or false.")
+    try:
+        timeout = _get_http_timeout(host)
+        if not isfinite(timeout) or timeout <= 0:
+            raise ValueError
+    except (ValueError, TypeError):
+        add(
+            "error",
+            "invalid_http_timeout",
+            "http_timeout",
+            "HTTP timeout must be a positive finite number.",
+            "Set http_timeout in seconds, for example 10.",
+        )
+    base_url = host.get("base_url")
+    if base_url is not None:
+        try:
+            parsed = urlsplit(base_url)
+            valid_url = parsed.scheme in ("http", "https") and bool(parsed.hostname) and not parsed.username
+        except (ValueError, TypeError, AttributeError):
+            valid_url = False
+        if not valid_url:
+            add(
+                "error",
+                "invalid_base_url",
+                "base_url",
+                "HTTP base URL is invalid or contains embedded credentials.",
+                "Use an http(s) URL without embedded credentials.",
+            )
+    headers = host.get("http_headers", {})
+    if not isinstance(headers, dict) or any(
+        not isinstance(k, str) or not isinstance(v, str) for k, v in headers.items()
+    ):
+        add(
+            "error",
+            "invalid_http_headers",
+            "http_headers",
+            "HTTP headers must map string names to string values.",
+            "Correct the header mapping; values are not included in this report.",
+        )
+    elif any("CHANGE_ME" in value for value in headers.values()):
+        add(
+            "error",
+            "placeholder_credentials",
+            "http_headers",
+            "An HTTP credential placeholder is still configured.",
+            "Replace the placeholder in the local credential configuration.",
+        )
+
+    settings = host.get("serial_settings")
+    if settings is not None:
+        if not isinstance(settings, dict) or not isinstance(settings.get("port"), str) or not settings["port"]:
+            add(
+                "error",
+                "invalid_serial_settings",
+                "serial_settings",
+                "Serial settings require a non-empty port.",
+                "Set serial_settings.port to the local serial device.",
+            )
+        else:
+            try:
+                serial_type = _resolve_serial_device_type(settings, host.platform)
+                if serial_type not in CLASS_MAPPER:
+                    raise ValueError
+            except (ValueError, AttributeError):
+                add(
+                    "error",
+                    "unsupported_serial_platform",
+                    "serial_settings.device_type",
+                    "No serial driver matches this host.",
+                    "Set a supported Netmiko serial device_type explicitly.",
+                )
+            for field, value in {"username": host.username, "password": host.password}.items():
+                if value == "CHANGE_ME":
+                    add(
+                        "error",
+                        "placeholder_credentials",
+                        field,
+                        "A serial credential placeholder is still configured.",
+                        "Set top-level serial credentials; SSH extras are not used by serial connections.",
+                    )
+            if not host.username or not host.password:
+                add(
+                    "warning",
+                    "serial_credentials_missing",
+                    "credentials",
+                    "Top-level serial credentials are incomplete.",
+                    "Set top-level username/password if this console requires authentication.",
+                )
+    return checks
+
+
+@mcp.tool()
+def diagnose_setup() -> DiagnosticReport:
+    """Check local setup without contacting devices, NetBox or other remote inventories.
+
+    Reports config/inventory paths, malformed YAML, missing credentials/placeholders,
+    unsupported drivers and invalid HTTP/serial settings. Credential values and YAML
+    parser excerpts are never included. Remote inventory validation is explicitly skipped.
+    """
+    report: DiagnosticReport = {
+        "status": "success",
+        "config_path": str(CONFIG_FILE.expanduser().resolve()),
+        "inventory_plugin": None,
+        "inventory_files": {},
+        "network_accessed": False,
+        "hosts_checked": None,
+        "checks": [],
+    }
+    checks = report["checks"]
+
+    def add(status: Literal["ok", "warning", "error"], code: str, message: str, hint: str = "") -> None:
+        checks.append({"status": status, "code": code, "message": message, "hint": hint})
+
+    try:
+        config = _load_config()
+    except FileNotFoundError:
+        add(
+            "error",
+            "config_missing",
+            "Configuration file does not exist.",
+            "Set NORNIR_MCP_CONFIG to an existing config file.",
+        )
+    except Exception:
+        add(
+            "error",
+            "config_invalid",
+            "Configuration could not be parsed or contains invalid options.",
+            "Check YAML syntax and Nornir option types locally. Parser excerpts are omitted to protect credentials.",
+        )
+    else:
+        report["inventory_plugin"] = config.inventory.plugin
+        paths = _inventory_paths(config)
+        report["inventory_files"] = {field: str(path) for field, path in paths.items()}
+        add("ok", "config_loaded", "Configuration loaded successfully.")
+        if config.logging.enabled and config.logging.to_console:
+            add(
+                "warning",
+                "stdio_logging",
+                "Nornir console logging can interfere with MCP stdio transport.",
+                "Set logging.enabled: false or logging.to_console: false.",
+            )
+        if config.runner.plugin == "threaded":
+            workers = config.runner.options.get("num_workers", 20)
+            if isinstance(workers, bool) or not isinstance(workers, int) or workers < 1:
+                add(
+                    "error",
+                    "invalid_worker_count",
+                    "Threaded runner worker count must be a positive integer.",
+                    "Set runner.options.num_workers to a positive integer.",
+                )
+        if config.runner.plugin not in {entry.name for entry in entry_points(group="nornir.plugins.runners")}:
+            add(
+                "error",
+                "runner_plugin_missing",
+                "The configured runner plugin is not installed.",
+                "Select threaded or serial, or install the configured runner plugin.",
+            )
+        if config.inventory.transform_function:
+            add(
+                "warning",
+                "inventory_transform_skipped",
+                "Inventory transforms are skipped during offline diagnosis.",
+                "Credentials or metadata added by a transform cannot be validated by this offline check.",
+            )
+        inventory_plugins = {entry.name for entry in entry_points(group="nornir.plugins.inventory")}
+        if config.inventory.plugin not in inventory_plugins:
+            add(
+                "error",
+                "inventory_plugin_missing",
+                "The configured inventory plugin is not installed.",
+                "Install the plugin or select SimpleInventory.",
+            )
+        elif config.inventory.plugin == "SimpleInventory":
+            for field, path in paths.items():
+                if not path.is_file():
+                    add(
+                        "error" if field == "host_file" else "warning",
+                        "inventory_file_missing",
+                        f"The {field} inventory file does not exist.",
+                        "Copy and edit the example inventory, or correct the configured path.",
+                    )
+            if paths["host_file"].is_file():
+                try:
+                    inventory = SimpleInventory(**config.inventory.options).load()
+                except Exception:
+                    add(
+                        "error",
+                        "inventory_invalid",
+                        "Inventory YAML or group references are invalid.",
+                        "Check hosts/groups/defaults locally. Parser excerpts are omitted to protect credentials.",
+                    )
+                else:
+                    report["hosts_checked"] = len(inventory.hosts)
+                    if not inventory.hosts:
+                        add("warning", "inventory_empty", "No hosts are registered.", "Add hosts to the inventory.")
+                    for host in inventory.hosts.values():
+                        try:
+                            checks.extend(_diagnose_host(host))
+                        except Exception:
+                            checks.append(
+                                {
+                                    "status": "error",
+                                    "code": "host_invalid",
+                                    "host": host.name,
+                                    "message": "Host settings have invalid types.",
+                                    "hint": "Check this host's local configuration.",
+                                }
+                            )
+        else:
+            add(
+                "warning",
+                "remote_inventory_skipped",
+                "Remote inventory was not loaded; device settings were not checked.",
+                "Use get_inventory_summary to load the configured remote inventory separately.",
+            )
+            if config.inventory.plugin == "NetBoxInventory2":
+                if config.inventory.options.get("nb_token"):
+                    add(
+                        "warning",
+                        "netbox_token_in_config",
+                        "NetBox token is stored in the configuration file.",
+                        "Prefer supplying NB_TOKEN through the server environment or a secret injection mechanism.",
+                    )
+                if not (config.inventory.options.get("nb_token") or os.environ.get("NB_TOKEN")):
+                    add(
+                        "error",
+                        "netbox_token_missing",
+                        "No NetBox API token is configured.",
+                        "Supply NB_TOKEN to the server process.",
+                    )
+                if not (config.inventory.options.get("nb_url") or os.environ.get("NB_URL")):
+                    add(
+                        "warning",
+                        "netbox_url_default",
+                        "NetBox URL is unset and would use the plugin default.",
+                        "Configure nb_url or supply NB_URL to the server process.",
+                    )
+    report["status"] = (
+        "failed"
+        if any(c["status"] == "error" for c in checks)
+        else ("warning" if any(c["status"] == "warning" for c in checks) else "success")
+    )
+    return report
 
 
 def _format_agg_result(
