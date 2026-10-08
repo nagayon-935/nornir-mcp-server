@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 An MCP (Model Context Protocol) server that exposes the **Nornir** network automation framework to AI agents. The design premise: instead of "iterate over a device list", the agent supplies metadata filters (`{"role": "core", "site": "tokyo"}`) and Nornir resolves the target set and runs tasks against it in parallel.
 
-Everything lives in one module — `server.py`. `main.py` is a leftover `uv init` hello-world and is not an entry point.
+Everything lives in one module — `server.py`, which is also the only entry point.
 
 ## Commands
 
@@ -28,12 +28,12 @@ Tests (the suite stubs `_get_nornir`, so it never touches a device or the networ
 uv run pytest tests/ -v
 ```
 
-Target is 80%+ coverage. Cover new tools at both the helper level and the tool level — the no-hosts early return and connection cleanup contract are parametrized across every task-running tool in `tests/test_server.py`; add new tools to that list. A regression test uses the real Nornir runner with fake connections to verify cleanup on failed hosts, without contacting devices.
+Target is 80%+ coverage. Cover new tools at both the helper level and the tool level — the no-hosts early return and connection cleanup contract are parametrized across every task-running tool in `tests/test_tool_contract.py` (the `CONNECTION_TOOLS` list in `tests/support.py`); add new tools to that list. Tests are split by area (`test_http.py`, `test_serial.py`, `test_template.py`, `test_inventory.py`, `test_results.py`); shared fakes live in `tests/support.py`. A regression test uses the real Nornir runner with fake connections to verify cleanup on failed hosts, without contacting devices.
 
 Single test / single class:
 
 ```bash
-uv run pytest tests/test_server.py::TestResolveSerialDeviceType::test_appends_serial_suffix_to_platform -v
+uv run pytest tests/test_serial.py::TestResolveSerialDeviceType::test_appends_serial_suffix_to_platform -v
 ```
 
 `pyproject.toml` sets `pythonpath = ["."]` so `from server import ...` works in tests without installing the package.
@@ -64,13 +64,15 @@ Both are gitignored — they hold device credentials.
 
 ### The tool pattern
 
-Every `@mcp.tool()` that *runs tasks against hosts* follows the same shape, and new tools should match it. `get_inventory` is the deliberate exception: it only reads `nr.inventory`, so it has no `nr.run`, no `close_connections()` (it opens no connections), no `_format_agg_result`, and it returns `{}` rather than the no-match string. Don't "fix" it to conform.
+Every `@mcp.tool()` that *runs tasks against hosts* goes through `_run_tool(action, filter_criteria, run, *, num_workers=None, log_context="")`, and new tools should do the same. The tool supplies only a `run(nr, stack)` callable that returns the `AggregatedResult` (a lambda for simple tools; a nested function when setup is needed, as in `run_http_request` and `generate_config`). `_run_tool` owns the rest of the contract:
 
-1. `_get_nornir(filter_criteria, num_workers=None)` — fresh `InitNornir` per call (no shared long-lived Nornir object), then `nr.filter(F(**filter_criteria))`.
-2. Early-return `"No hosts matched the filter criteria."` when the filter selects nothing.
-3. Run inside `with _get_nornir(...) as nr`, including the early return and any setup. Nornir's context manager closes connections on both successful and failed hosts; plain `nr.close_connections()` excludes failed hosts by default. Connection cleanup is not optional; leaking netmiko sessions holds device VTYs open.
+1. `_get_nornir(filter_criteria, num_workers)` — fresh `InitNornir` per call (no shared long-lived Nornir object), then `nr.filter(F(**filter_criteria))`.
+2. Early-return `NO_MATCH_MESSAGE` (`"No hosts matched the filter criteria."`) when the filter selects nothing.
+3. Everything runs inside `with _get_nornir(...) as nr, ExitStack() as stack`, including the early return and any setup. Nornir's context manager closes connections on both successful and failed hosts; plain `nr.close_connections()` excludes failed hosts by default. Connection cleanup is not optional; leaking netmiko sessions holds device VTYs open. Extra resources (e.g. httpx clients) are registered on `stack` so they are released on every path.
 4. `_format_agg_result(agg_result)` — collapses Nornir's `AggregatedResult` into `{host: {"output": ...}}` or `{host: {"error": ...}}` JSON. Returns the first failed result's error if any task/subtask failed, otherwise `multi_result[0]`'s output; tolerates an empty `MultiResult`.
-5. Broad `except Exception` returning an error **string** rather than raising — MCP tools return text to the agent, so failures must be reported, not propagated. Pair every one with `logger.exception(...)` including the filter criteria.
+5. Broad `except Exception` returning `"Error {action}: ..."` as a **string** rather than raising — MCP tools return text to the agent, so failures must be reported, not propagated. Logged with `logger.exception(...)` including `log_context` and the filter criteria.
+
+`get_inventory` is the deliberate exception: it only reads `nr.inventory`, so it bypasses `_run_tool` — no `nr.run`, no `close_connections()` (it opens no connections), no `_format_agg_result`, and it returns `{}` rather than the no-match string. Don't "fix" it to conform.
 
 ### Task implementations
 

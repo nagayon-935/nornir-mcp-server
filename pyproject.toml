@@ -1,7 +1,7 @@
 [project]
 name = "nornir-mcp-server"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server that exposes the Nornir network automation framework to AI agents"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

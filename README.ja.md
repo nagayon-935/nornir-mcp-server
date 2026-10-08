@@ -6,14 +6,13 @@
 
 従来の「全機器リストを順番に叩く」アプローチではなく、AI 自身が Nornir の強力なメタデータ・フィルタリング機能（`nornir.filter`）を活用し、「東京拠点のコアルーターだけを対象にする」といった自律的な対象選定と並列実行を可能にします。
 
-## 現在のステータス
-* **Phase 1, 2, 3 実装完了 (フル機能)**
-  * `SimpleInventory` (YAML) および NetBox (`nornir_netbox`) サポート
-  * `show` 系コマンドの並列実行 (SSH/Telnet)
-  * REST API コマンドの実行サポート (`httpx` 経由)
-  * ホストへの直接シリアル接続サポート (`netmiko` シリアルモード)
-  * Jinja2 を用いたコンフィグの動的生成
-  * 実機への設定投入 (Config Deploy)
+## 機能一覧
+* `SimpleInventory` (YAML) および NetBox (`nornir_netbox`) サポート
+* `show` 系コマンドの並列実行 (SSH/Telnet)
+* REST API コマンドの実行サポート (`httpx` 経由)
+* ホストへの直接シリアル接続サポート (`netmiko` シリアルモード)
+* Jinja2 を用いたコンフィグの動的生成
+* 実機への設定投入 (Config Deploy)
 
 ## 主な特徴
 * **柔軟なインベントリ**: Nornir のプラグインエコシステムをそのまま利用。独自の形式ではなく標準の `SimpleInventory` (hosts.yaml / groups.yaml) を利用します。NetBoxからの動的取得にも対応しています。
@@ -154,6 +153,13 @@ Jinja2 テンプレート（サンドボックス環境で実行）を用いて�
 ```bash
 uv sync
 uv run pytest tests/ -v
+```
+
+ruff による lint / フォーマット:
+
+```bash
+uv run ruff check .
+uv run ruff format .
 ```
 
 ## License
