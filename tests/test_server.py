@@ -105,44 +105,44 @@ class TestFormatAggResult:
     def test_returns_output_for_successful_result(self):
         agg_result = _build_agg_result(Result(host=None, result="Cisco IOS XE"))
 
-        output = json.loads(_format_agg_result(agg_result))
+        output = _format_agg_result(agg_result)
 
-        assert output == {"router1": {"output": "Cisco IOS XE"}}
+        assert output["results"] == {"router1": {"status": "success", "output": "Cisco IOS XE"}}
 
     def test_returns_exception_message_for_failed_result(self):
         agg_result = _build_agg_result(Result(host=None, failed=True, exception=ValueError("connection refused")))
 
-        output = json.loads(_format_agg_result(agg_result))
+        output = _format_agg_result(agg_result)
 
-        assert output == {"router1": {"error": "connection refused"}}
+        assert output["results"]["router1"]["error"]["message"] == "connection refused"
 
     def test_falls_back_to_result_text_when_failed_without_exception(self):
         agg_result = _build_agg_result(Result(host=None, failed=True, result="Traceback: something went wrong"))
 
-        output = json.loads(_format_agg_result(agg_result))
+        output = _format_agg_result(agg_result)
 
-        assert output == {"router1": {"error": "Traceback: something went wrong"}}
+        assert output["results"]["router1"]["error"]["message"] == "Traceback: something went wrong"
 
     def test_handles_empty_multi_result_without_index_error(self):
         agg_result = AggregatedResult("task")
         agg_result["router1"] = MultiResult("task")
 
-        output = json.loads(_format_agg_result(agg_result))
+        output = _format_agg_result(agg_result)
 
-        assert output == {"router1": {"error": "No result returned for host."}}
+        assert output["results"]["router1"]["error"]["message"] == "No result returned for host."
 
     def test_serializes_non_json_values_via_default_str(self):
         agg_result = _build_agg_result(Result(host=None, result={"uptime": complex(1, 2)}))
 
-        output = json.loads(_format_agg_result(agg_result))
+        output = _format_agg_result(agg_result)
 
-        assert output["router1"]["output"]["uptime"] == str(complex(1, 2))
+        assert output["results"]["router1"]["output"]["uptime"] == str(complex(1, 2))
 
     def test_reports_subtask_failure_even_when_parent_result_succeeded(self):
         agg_result = _build_agg_result(Result(host=None, result="parent output"))
         agg_result["router1"].append(Result(host=None, failed=True, exception=ValueError("subtask failed")))
 
-        assert json.loads(_format_agg_result(agg_result)) == {"router1": {"error": "subtask failed"}}
+        assert _format_agg_result(agg_result)["results"]["router1"]["error"]["message"] == "subtask failed"
 
 
 class TestResolveSerialDeviceType:
@@ -350,7 +350,7 @@ class TestNoHostsShortCircuit:
     def test_returns_no_match_message_without_running(self, patched_nornir, tool, kwargs):
         nr = patched_nornir(FakeNornir(hosts={}))
 
-        assert tool(**kwargs) == NO_MATCH_MESSAGE
+        assert tool(**kwargs)["status"] == "no_hosts"
         assert nr.run_calls == []
         assert nr.closed is True
 
@@ -368,7 +368,7 @@ class TestConnectionCleanup:
         agg_result = _build_agg_result(Result(host=None, result="ok"))
         nr = patched_nornir(FakeNornir(hosts={"router1": _fake_host()}, agg_result=agg_result))
 
-        assert json.loads(tool(**kwargs)) == {"router1": {"output": "ok"}}
+        assert tool(**kwargs, include_output=True)["results"] == {"router1": {"status": "success", "output": "ok"}}
         assert nr.closed is True
         assert nr.closed_failed_hosts is True
 
@@ -379,8 +379,8 @@ class TestConnectionCleanup:
         output = tool(**kwargs)
 
         assert nr.closed is True
-        assert "boom" in output
-        assert output.startswith("Error ")
+        assert output["error"]["message"] == "boom"
+        assert output["status"] == "failed"
 
 
 class TestToolRunnerArguments:
@@ -434,7 +434,7 @@ class TestToolRunnerArguments:
 
         output = generate_config("hostname {{ unclosed", all_hosts=True)
 
-        assert output.startswith("Error generating config:")
+        assert output["status"] == "failed"
         assert nr.run_calls == []
         assert nr.closed is True
 
@@ -487,7 +487,7 @@ class TestHttpClientFanOut:
 
         output = run_http_request("GET", "/api", all_hosts=True)
 
-        assert "client initialization failed" in output
+        assert output["error"]["message"] == "client initialization failed"
         assert created[0].closed is True
         assert nr.closed is True
         assert nr.run_calls == []
@@ -514,7 +514,7 @@ class TestHttpClientFanOut:
 
         output = run_http_request("GET", "/api", all_hosts=True)
 
-        assert "client close failed" in output
+        assert output["error"]["message"] == "client close failed"
         assert all(client.closed for client in created)
         assert nr.closed is True
 
@@ -630,9 +630,9 @@ def test_failed_nornir_hosts_have_their_connections_closed(monkeypatch):
     monkeypatch.setattr(server, "_get_nornir", lambda *args, **kwargs: nr)
     monkeypatch.setattr(server, "netmiko_send_command", command_task)
 
-    output = json.loads(run_netmiko_command("show version", all_hosts=True))
+    output = run_netmiko_command("show version", all_hosts=True, include_output=True)["results"]
 
-    assert output["healthy"] == {"output": "ok"}
-    assert output["failed"] == {"error": "command failed after connecting"}
+    assert output["healthy"] == {"status": "success", "output": "ok"}
+    assert output["failed"]["error"]["message"] == "command failed after connecting"
     assert sorted(closed_hosts) == ["failed", "healthy"]
     assert all(not host.connections for host in hosts.values())

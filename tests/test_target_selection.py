@@ -76,7 +76,7 @@ def test_invalid_pagination_does_not_load_inventory(monkeypatch, offset, limit):
 @pytest.mark.parametrize("filters", [None, {}])
 def test_missing_selection_is_rejected_before_inventory_access(monkeypatch, tool, kwargs, filters):
     monkeypatch.setattr(server, "_get_nornir", lambda *args, **kwargs: pytest.fail("must not load inventory"))
-    assert "Target selection required" in tool(**kwargs, filter_criteria=filters)
+    assert tool(**kwargs, filter_criteria=filters)["error"]["code"] == "target_selection_required"
 
 
 def test_netbox_choices_provide_the_correct_nested_filter(monkeypatch):

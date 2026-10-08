@@ -71,8 +71,8 @@ Every `@mcp.tool()` that *runs tasks against hosts* follows the same shape, and 
 1. `_get_nornir(filter_criteria, num_workers=None)` — fresh `InitNornir` per call (no shared long-lived Nornir object), then `nr.filter(F(**filter_criteria))`.
 2. Early-return `"No hosts matched the filter criteria."` when the filter selects nothing.
 3. Run inside `with _get_nornir(...) as nr`, including the early return and any setup. Nornir's context manager closes connections on both successful and failed hosts; plain `nr.close_connections()` excludes failed hosts by default. Connection cleanup is not optional; leaking netmiko sessions holds device VTYs open.
-4. `_format_agg_result(agg_result)` — collapses Nornir's `AggregatedResult` into `{host: {"output": ...}}` or `{host: {"error": ...}}` JSON. Returns the first failed result's error if any task/subtask failed, otherwise `multi_result[0]`'s output; tolerates an empty `MultiResult`.
-5. Broad `except Exception` returning an error **string** rather than raising — MCP tools return text to the agent, so failures must be reported, not propagated. Pair every one with `logger.exception(...)` including the filter criteria.
+4. `_format_agg_result` returns an `ExecutionReport` with whole-run status/counts and per-host results. The five task tools use typed dictionaries so FastMCP exposes an output schema. Successful output is omitted by default (`include_output=False`); `get_execution_details` retrieves it by execution ID without another device operation. The locked cache has TTL, count and byte limits. Preserve completed results when cleanup fails.
+5. Broad `except Exception` returns a structured error report via `_tool_error`, rather than raising. Errors include a stable code and recovery hint. Pass any completed report so cleanup failures cannot erase an already-applied change. `get_inventory` retains its legacy text format.
 
 ### Task implementations
 
