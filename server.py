@@ -1,16 +1,20 @@
 import json
 import logging
 import os
-from collections import Counter
+from collections import Counter, OrderedDict
 from contextlib import ExitStack
 from pathlib import Path
-from typing import Any
+from threading import Lock
+from time import monotonic
+from typing import Any, Literal, NotRequired, TypedDict
+from uuid import uuid4
 
 import httpx
 from jinja2 import Template
 from jinja2.sandbox import SandboxedEnvironment
 from mcp.server.fastmcp import FastMCP
 from netmiko import ConnectHandler
+from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 from nornir import InitNornir
 from nornir.core import Nornir
 from nornir.core.filter import F
@@ -37,6 +41,110 @@ mcp = FastMCP(
 _JINJA_ENV = SandboxedEnvironment()
 
 
+class ErrorDetail(TypedDict):
+    code: str
+    message: str
+    hint: str
+
+
+class HostResult(TypedDict):
+    status: Literal["success", "failed"]
+    output: NotRequired[Any]
+    error: NotRequired[ErrorDetail]
+
+
+class ExecutionSummary(TypedDict):
+    total: int
+    succeeded: int
+    failed: int
+    duration_seconds: float
+
+
+class ExecutionReport(TypedDict):
+    status: Literal["success", "partial_failure", "failed", "no_hosts"]
+    execution_id: str | None
+    summary: ExecutionSummary
+    results: dict[str, HostResult]
+    error: NotRequired[ErrorDetail]
+    next_offset: NotRequired[int | None]
+    details_available: NotRequired[bool]
+    message: NotRequired[str]
+
+
+_RESULT_TTL = 900.0
+_MAX_RESULTS = 100
+_MAX_RESULT_BYTES = 16 * 1024 * 1024
+_RESULT_CACHE: OrderedDict[str, tuple[float, int, ExecutionReport]] = OrderedDict()
+_RESULT_LOCK = Lock()
+
+
+def _purge_results(now: float) -> None:
+    """Caller holds _RESULT_LOCK; expiry follows creation, independent of LRU order."""
+    for execution_id, (created, _, _) in list(_RESULT_CACHE.items()):
+        if now - created >= _RESULT_TTL:
+            del _RESULT_CACHE[execution_id]
+
+
+def _error_detail(error: Exception | None, message: str) -> ErrorDetail:
+    code, hint = "execution_error", "Check the operation and server configuration."
+    if isinstance(error, NetmikoAuthenticationException):
+        code, hint = "authentication_failed", "Check the device credentials and account permissions."
+    elif isinstance(error, (NetmikoTimeoutException, httpx.TimeoutException)):
+        code, hint = "timeout", "Check device reachability and the configured timeout."
+    elif isinstance(error, httpx.HTTPStatusError):
+        if error.response.status_code in (401, 403):
+            code, hint = "authentication_failed", "Check the HTTP credentials and endpoint permissions."
+        else:
+            code, hint = "http_error", "Check the HTTP method, path and payload."
+    elif isinstance(error, httpx.ConnectError):
+        code, hint = "connection_failed", "Check the address, network connectivity and TLS settings."
+    elif message.startswith("Target selection required:"):
+        code, hint = (
+            "target_selection_required",
+            "Preview targets and provide a filter, or explicitly set all_hosts=True.",
+        )
+    return {"code": code, "message": message, "hint": hint}
+
+
+def _empty_report(status: Literal["failed", "no_hosts"], started: float | None = None) -> ExecutionReport:
+    return {
+        "status": status,
+        "execution_id": None,
+        "summary": {
+            "total": 0,
+            "succeeded": 0,
+            "failed": 0,
+            "duration_seconds": round(monotonic() - started, 3) if started is not None else 0.0,
+        },
+        "results": {},
+    }
+
+
+def _tool_error(
+    operation: str, error: Exception, started: float, completed: ExecutionReport | None = None
+) -> ExecutionReport:
+    logger.exception("Error %s", operation)
+    if completed is not None:
+        report = {**completed, "status": "partial_failure" if completed["summary"]["succeeded"] else "failed"}
+        report["error"] = _error_detail(error, str(error))
+        report["error"]["code"] = "cleanup_failed"
+        report["message"] = "Tasks completed but cleanup failed. Inspect their results before repeating any operation."
+        with _RESULT_LOCK:
+            entry = _RESULT_CACHE.get(report["execution_id"])
+            if entry is not None:
+                full_report = {
+                    **entry[2],
+                    "status": report["status"],
+                    "error": report["error"],
+                    "message": report["message"],
+                }
+                _RESULT_CACHE[report["execution_id"]] = (entry[0], entry[1], full_report)
+        return report
+    report = _empty_report("failed", started)
+    report["error"] = _error_detail(error, str(error))
+    return report
+
+
 def _get_nornir(filter_criteria: dict[str, Any] | None = None, num_workers: int | None = None) -> Nornir:
     """Initialize Nornir and apply filtering if provided."""
     kwargs: dict[str, Any] = {}
@@ -49,21 +157,108 @@ def _get_nornir(filter_criteria: dict[str, Any] | None = None, num_workers: int 
     return nr
 
 
-def _format_agg_result(agg_result: AggregatedResult) -> str:
-    """Convert an AggregatedResult into a JSON string of per-host outputs/errors."""
-    output_data: dict[str, dict[str, Any]] = {}
+def _format_agg_result(
+    agg_result: AggregatedResult, include_output: bool = True, started: float | None = None
+) -> ExecutionReport:
+    """Summarize a run and cache its full output for later, paginated retrieval."""
+    if not agg_result:
+        return _empty_report("no_hosts", started)
+    output_data: dict[str, HostResult] = {}
     for host_name, multi_result in agg_result.items():
         if len(multi_result) == 0:
-            output_data[host_name] = {"error": "No result returned for host."}
+            output_data[host_name] = {"status": "failed", "error": _error_detail(None, "No result returned for host.")}
             continue
         failed_result = next((result for result in multi_result if result.failed), None)
         if failed_result is not None:
             result = failed_result
             detail = str(result.exception) if result.exception else str(result.result)
-            output_data[host_name] = {"error": detail}
+            output_data[host_name] = {"status": "failed", "error": _error_detail(result.exception, detail)}
         else:
-            output_data[host_name] = {"output": multi_result[0].result}
-    return json.dumps(output_data, indent=2, default=str)
+            output_data[host_name] = {"status": "success", "output": multi_result[0].result}
+    failed = sum(result["status"] == "failed" for result in output_data.values())
+    total = len(output_data)
+    report: ExecutionReport = {
+        "status": "success" if not failed else "failed" if failed == total else "partial_failure",
+        "execution_id": uuid4().hex,
+        "summary": {
+            "total": total,
+            "succeeded": total - failed,
+            "failed": failed,
+            "duration_seconds": round(monotonic() - started, 3) if started is not None else 0.0,
+        },
+        "results": output_data,
+        "details_available": True,
+    }
+    # Normalize non-JSON values once so MCP output and cached details agree.
+    serialized = json.dumps(report, default=str)
+    report = json.loads(serialized)
+    size = len(serialized.encode())
+    with _RESULT_LOCK:
+        _purge_results(monotonic())
+        if size <= _MAX_RESULT_BYTES:
+            while _RESULT_CACHE and (
+                len(_RESULT_CACHE) >= _MAX_RESULTS
+                or sum(entry[1] for entry in _RESULT_CACHE.values()) + size > _MAX_RESULT_BYTES
+            ):
+                _RESULT_CACHE.popitem(last=False)
+            _RESULT_CACHE[report["execution_id"]] = (monotonic(), size, report)
+        else:
+            report["execution_id"] = None
+            report["details_available"] = False
+            report["message"] = "Output exceeds the result-cache limit; full output is included in this response."
+            include_output = True
+    if include_output:
+        return json.loads(json.dumps(report))
+    return {
+        **report,
+        "results": {
+            name: {k: v for k, v in result.items() if k != "output"} for name, result in report["results"].items()
+        },
+    }
+
+
+@mcp.tool()
+def get_execution_details(
+    execution_id: str, host_names: list[str] | None = None, offset: int = 0, limit: int = 20
+) -> ExecutionReport:
+    """Retrieve stored output without rerunning an operation or connecting to devices.
+
+    Results expire after 15 minutes and may be evicted earlier from the bounded in-memory
+    cache. A server restart clears them. Select exact host_names or paginate by sorted host
+    name (limit 1–200). summary/status always describe the full original execution.
+    """
+    if offset < 0 or not 1 <= limit <= 200:
+        report = _empty_report("failed")
+        report["error"] = _error_detail(None, "offset must be non-negative and limit must be between 1 and 200.")
+        report["error"]["code"] = "invalid_arguments"
+        return report
+    with _RESULT_LOCK:
+        _purge_results(monotonic())
+        entry = _RESULT_CACHE.get(execution_id)
+        if entry is None:
+            report = _empty_report("failed")
+            report["error"] = {
+                "code": "result_not_found",
+                "message": "Execution ID is unknown, expired or evicted.",
+                "hint": "Results are temporary. Do not repeat configuration changes just to retrieve their output.",
+            }
+            return report
+        _RESULT_CACHE.move_to_end(execution_id)
+        cached = entry[2]
+        names = sorted(cached["results"] if host_names is None else set(host_names))
+        if any(name not in cached["results"] for name in names):
+            report = _empty_report("failed")
+            report["error"] = _error_detail(None, "A requested host is not part of this execution.")
+            report["error"]["code"] = "unknown_host"
+            return report
+        selected = names[offset : offset + limit]
+        report = {
+            **cached,
+            "results": {name: cached["results"][name] for name in selected},
+            "next_offset": offset + len(selected) if offset + len(selected) < len(names) else None,
+        }
+        # Avoid returning mutable references into the shared cache.
+        return json.loads(json.dumps(report))
 
 
 def _host_metadata(host: Host) -> dict[str, Any]:
@@ -182,8 +377,12 @@ def get_inventory(filter_criteria: dict[str, Any] | None = None) -> str:
 
 @mcp.tool()
 def run_netmiko_command(
-    command: str, filter_criteria: dict[str, Any] | None = None, use_textfsm: bool = False, all_hosts: bool = False
-) -> str:
+    command: str,
+    filter_criteria: dict[str, Any] | None = None,
+    use_textfsm: bool = False,
+    all_hosts: bool = False,
+    include_output: bool = False,
+) -> ExecutionReport:
     """
     Run a show command concurrently on multiple hosts via Netmiko.
 
@@ -192,17 +391,22 @@ def run_netmiko_command(
         filter_criteria: Non-empty dictionary of key-value pairs to filter target hosts.
         use_textfsm: If True, attempts to parse output into structured data using ntc-templates.
         all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
+        include_output: Include full output now; otherwise retrieve it later with get_execution_details.
     """
+    started = monotonic()
+    report = None
     try:
         # Nornir's context manager also closes connections on failed hosts.
         with _target_nornir(filter_criteria, all_hosts) as nr:
             if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
-            agg_result = nr.run(task=netmiko_send_command, command_string=command, use_textfsm=use_textfsm)
-            return _format_agg_result(agg_result)
+                return _empty_report("no_hosts", started)
+            agg_result = nr.run(
+                task=netmiko_send_command, raise_on_error=False, command_string=command, use_textfsm=use_textfsm
+            )
+            report = _format_agg_result(agg_result, include_output, started)
+            return report
     except Exception as e:
-        logger.exception(f"Error executing command (command={command!r}, filter={filter_criteria})")
-        return f"Error executing command: {str(e)}"
+        return _tool_error("executing command", e, started, report)
 
 
 def _get_tls_verify(host: Host) -> bool:
@@ -252,7 +456,8 @@ def run_http_request(
     filter_criteria: dict[str, Any] | None = None,
     json_data: dict | None = None,
     all_hosts: bool = False,
-) -> str:
+    include_output: bool = False,
+) -> ExecutionReport:
     """
     Run an HTTP API request (REST) concurrently on multiple hosts.
 
@@ -262,14 +467,17 @@ def run_http_request(
         filter_criteria: Dictionary to filter target hosts.
         json_data: Optional JSON payload for POST/PUT requests.
         all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
+        include_output: Include full output now; otherwise retrieve it later with get_execution_details.
 
     Per-host settings come from inventory data, including group/default inheritance:
     'base_url', 'http_headers', 'tls_verify', and 'http_timeout' (seconds, defaults to 10).
     """
+    started = monotonic()
+    report = None
     try:
         with _target_nornir(filter_criteria, all_hosts) as nr, ExitStack() as stack:
             if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
+                return _empty_report("no_hosts", started)
 
             # Register cleanup immediately, including for partial initialization.
             # Clients are shared across threads, one per TLS verification setting.
@@ -279,11 +487,18 @@ def run_http_request(
                 client = httpx.Client(verify=verify, timeout=HTTP_TIMEOUT)
                 stack.callback(client.close)
                 clients[verify] = client
-            agg_result = nr.run(task=custom_http_task, clients=clients, method=method, path=path, json_data=json_data)
-            return _format_agg_result(agg_result)
+            agg_result = nr.run(
+                task=custom_http_task,
+                raise_on_error=False,
+                clients=clients,
+                method=method,
+                path=path,
+                json_data=json_data,
+            )
+            report = _format_agg_result(agg_result, include_output, started)
+            return report
     except Exception as e:
-        logger.exception(f"Error executing HTTP request (method={method}, path={path}, filter={filter_criteria})")
-        return f"Error executing HTTP request: {str(e)}"
+        return _tool_error("executing HTTP request", e, started, report)
 
 
 def _resolve_serial_device_type(serial_settings: dict[str, Any], platform: str | None) -> str:
@@ -324,7 +539,9 @@ def custom_serial_task(task: Task, command: str) -> Result:
 
 
 @mcp.tool()
-def run_serial_command(command: str, filter_criteria: dict[str, Any] | None = None, all_hosts: bool = False) -> str:
+def run_serial_command(
+    command: str, filter_criteria: dict[str, Any] | None = None, all_hosts: bool = False, include_output: bool = False
+) -> ExecutionReport:
     """
     Run a CLI command on devices via direct Serial connection (using Netmiko).
 
@@ -335,16 +552,19 @@ def run_serial_command(command: str, filter_criteria: dict[str, Any] | None = No
         command: The CLI command to execute (e.g., 'show version').
         filter_criteria: Dictionary to filter target hosts.
         all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
+        include_output: Include full output now; otherwise retrieve it later with get_execution_details.
     """
+    started = monotonic()
+    report = None
     try:
         with _target_nornir(filter_criteria, all_hosts, num_workers=1) as nr:
             if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
-            agg_result = nr.run(task=custom_serial_task, command=command)
-            return _format_agg_result(agg_result)
+                return _empty_report("no_hosts", started)
+            agg_result = nr.run(task=custom_serial_task, raise_on_error=False, command=command)
+            report = _format_agg_result(agg_result, include_output, started)
+            return report
     except Exception as e:
-        logger.exception(f"Error executing serial command (command={command!r}, filter={filter_criteria})")
-        return f"Error executing serial command: {str(e)}"
+        return _tool_error("executing serial command", e, started, report)
 
 
 def custom_template_task(task: Task, template: Template) -> Result:
@@ -363,8 +583,11 @@ def custom_template_task(task: Task, template: Template) -> Result:
 
 @mcp.tool()
 def generate_config(
-    template_string: str, filter_criteria: dict[str, Any] | None = None, all_hosts: bool = False
-) -> str:
+    template_string: str,
+    filter_criteria: dict[str, Any] | None = None,
+    all_hosts: bool = False,
+    include_output: bool = False,
+) -> ExecutionReport:
     """
     Generate configuration from a Jinja2 template string for each target host.
     Does NOT deploy the configuration; useful for dry-runs and auditing.
@@ -376,25 +599,31 @@ def generate_config(
                          host.data includes inherited group/default values.
         filter_criteria: Dictionary to filter target hosts.
         all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
+        include_output: Include full output now; otherwise retrieve it later with get_execution_details.
     """
+    started = monotonic()
+    report = None
     try:
         with _target_nornir(filter_criteria, all_hosts) as nr:
             if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
+                return _empty_report("no_hosts", started)
 
             # Compile once for all hosts, inside the connection cleanup scope.
             template = _JINJA_ENV.from_string(template_string)
-            agg_result = nr.run(task=custom_template_task, template=template)
-            return _format_agg_result(agg_result)
+            agg_result = nr.run(task=custom_template_task, raise_on_error=False, template=template)
+            report = _format_agg_result(agg_result, include_output, started)
+            return report
     except Exception as e:
-        logger.exception(f"Error generating config (filter={filter_criteria})")
-        return f"Error generating config: {str(e)}"
+        return _tool_error("generating config", e, started, report)
 
 
 @mcp.tool()
 def run_netmiko_config(
-    commands: list[str], filter_criteria: dict[str, Any] | None = None, all_hosts: bool = False
-) -> str:
+    commands: list[str],
+    filter_criteria: dict[str, Any] | None = None,
+    all_hosts: bool = False,
+    include_output: bool = False,
+) -> ExecutionReport:
     """
     WRITE OPERATION: modifies device configuration.
     Deploy configuration commands concurrently to multiple hosts via Netmiko.
@@ -404,16 +633,19 @@ def run_netmiko_config(
         commands: List of configuration commands to execute.
         filter_criteria: Dictionary to filter target hosts.
         all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
+        include_output: Include full output now; otherwise retrieve it later with get_execution_details.
     """
+    started = monotonic()
+    report = None
     try:
         with _target_nornir(filter_criteria, all_hosts) as nr:
             if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
-            agg_result = nr.run(task=netmiko_send_config, config_commands=commands)
-            return _format_agg_result(agg_result)
+                return _empty_report("no_hosts", started)
+            agg_result = nr.run(task=netmiko_send_config, raise_on_error=False, config_commands=commands)
+            report = _format_agg_result(agg_result, include_output, started)
+            return report
     except Exception as e:
-        logger.exception(f"Error executing config commands (filter={filter_criteria})")
-        return f"Error executing config commands: {str(e)}"
+        return _tool_error("executing config commands", e, started, report)
 
 
 if __name__ == "__main__":

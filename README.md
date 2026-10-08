@@ -157,6 +157,14 @@ All five task-running tools now require a non-empty `filter_criteria`, or an exp
 
 Example: discover values → preview with `{"site": "tokyo", "role": "core"}` → run `run_netmiko_command(command="show version", filter_criteria={"site": "tokyo", "role": "core"})`. For NetBox, use the exact nested filters returned by discovery.
 
+## Structured execution results
+
+The five task-running tools return structured MCP objects instead of JSON strings. The envelope contains `status` (`success`, `partial_failure`, `failed`, `no_hosts`), `execution_id`, `summary` (total/succeeded/failed/duration_seconds), and per-host `results`. Host errors include a machine-readable `code`, a message and a recovery hint. Authentication failures, timeouts and HTTP errors are distinguished. Operations are never retried automatically.
+
+By default, `include_output=False` returns host statuses and errors without successful command output. Set `include_output=True` to receive full output immediately, or call `get_execution_details(execution_id, host_names=["router1"])` afterward. Details can also be paginated with `offset` and `limit` (1–200); their summary/status always describe the original whole execution. Fetching details does not rerun the operation.
+
+Results live in this server process for up to 15 minutes, with limits of 100 runs and 16 MiB total serialized data. Older results may be evicted earlier; restarting the server clears the cache. Outputs larger than the cache limit are returned immediately with `details_available=False`. A cleanup failure preserves completed task results and returns `cleanup_failed`; inspect the result before repeating a configuration change. Inventory discovery tools retain their own inventory-specific result formats.
+
 ## Testing
 
 Unit tests live in `tests/`.

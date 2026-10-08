@@ -157,6 +157,14 @@ Jinja2 テンプレート（サンドボックス環境で実行）を用いて�
 
 例：候補を確認 → `{"site": "tokyo", "role": "core"}` で対象をプレビュー → `run_netmiko_command(command="show version", filter_criteria={"site": "tokyo", "role": "core"})` を実行。NetBox では候補に含まれる入れ子のフィルターを使ってください。
 
+## 構造化された実行結果
+
+タスクを実行する5つのツールは、JSON文字列に代わって構造化されたMCPオブジェクトを返します。`status`（`success`・`partial_failure`・`failed`・`no_hosts`）、`execution_id`、`summary`（総件数・成功件数・失敗件数・所要秒数）、機器ごとの `results` が含まれます。エラーには機械判読用の `code`・メッセージ・確認先の案内が入り、認証失敗・タイムアウト・HTTPエラーを区別できます。自動再実行は行いません。
+
+既定の `include_output=False` では機器ごとの状態とエラーを返し、成功したコマンドの詳細出力を省略します。すぐに詳細も受け取る場合は `include_output=True` を指定してください。後から `get_execution_details(execution_id, host_names=["router1"])` で特定の機器の出力を取得することもできます。`offset`・`limit`（1〜200）によるページ分割にも対応し、summary/status は常に元の実行全体を表します。詳細取得で処理を再実行することはありません。
+
+結果の保持期間は同じサーバープロセスで最大15分、上限は100実行・シリアライズ後の合計16 MiBです。上限に達した場合は古い結果が先に削除され、再起動でも消えます。キャッシュ上限を超える出力は `details_available=False` としてその場で返します。後処理で失敗しても完了したタスクの結果を保持し、`cleanup_failed` を返します。設定変更を再実行する前に結果を確認してください。台帳の照会・候補発見ツールは台帳向けの形式を維持します。
+
 ## テスト
 
 `tests/` にユニットテストがあります。
