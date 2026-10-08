@@ -71,6 +71,7 @@ def test_invalid_pagination_does_not_load_inventory(monkeypatch, offset, limit):
         (server.run_serial_command, {"command": "show version"}),
         (server.generate_config, {"template_string": "hostname {{ host.name }}"}),
         (server.run_netmiko_config, {"commands": ["hostname r1"]}),
+        (server.run_inspection, {"inspection": "os_version"}),
     ],
 )
 @pytest.mark.parametrize("filters", [None, {}])

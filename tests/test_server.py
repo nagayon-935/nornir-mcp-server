@@ -21,6 +21,7 @@ from server import (
     generate_config,
     get_inventory,
     run_http_request,
+    run_inspection,
     run_netmiko_command,
     run_netmiko_config,
     run_serial_command,
@@ -98,6 +99,7 @@ CONNECTION_TOOLS = [
         generate_config, {"template_string": "hostname {{ host.name }}", "all_hosts": True}, id="generate_config"
     ),
     pytest.param(run_netmiko_config, {"commands": ["hostname r1"], "all_hosts": True}, id="run_netmiko_config"),
+    pytest.param(run_inspection, {"inspection": "os_version", "all_hosts": True}, id="run_inspection"),
 ]
 
 

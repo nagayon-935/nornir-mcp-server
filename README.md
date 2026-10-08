@@ -153,13 +153,13 @@ Before running an operation, use `get_inventory_summary` to discover site, role 
 
 `preview_targets(filter_criteria, offset=0, limit=50)` returns the matching host names, addresses, platforms, groups and counts without connecting to devices. Results are sorted by name and paginated (limit 1–200). It exposes no authentication data. The preview reads the current inventory; it does not reserve targets for a later operation.
 
-All five task-running tools now require a non-empty `filter_criteria`, or an explicit `all_hosts=True`. Omitting both is rejected before loading inventory. A non-empty filter continues to restrict targets even when `all_hosts=True`.
+All task-running tools now require a non-empty `filter_criteria`, or an explicit `all_hosts=True`. Omitting both is rejected before loading inventory. A non-empty filter continues to restrict targets even when `all_hosts=True`.
 
 Example: discover values → preview with `{"site": "tokyo", "role": "core"}` → run `run_netmiko_command(command="show version", filter_criteria={"site": "tokyo", "role": "core"})`. For NetBox, use the exact nested filters returned by discovery.
 
 ## Structured execution results
 
-The five task-running tools return structured MCP objects instead of JSON strings. The envelope contains `status` (`success`, `partial_failure`, `failed`, `no_hosts`), `execution_id`, `summary` (total/succeeded/failed/duration_seconds), and per-host `results`. Host errors include a machine-readable `code`, a message and a recovery hint. Authentication failures, timeouts and HTTP errors are distinguished. Operations are never retried automatically.
+Task-running tools return structured MCP objects instead of JSON strings. The envelope contains `status` (`success`, `partial_failure`, `failed`, `no_hosts`), `execution_id`, `summary` (total/succeeded/failed/duration_seconds), and per-host `results`. Host errors include a machine-readable `code`, a message and a recovery hint. Authentication failures, timeouts and HTTP errors are distinguished. Operations are never retried automatically.
 
 By default, `include_output=False` returns host statuses and errors without successful command output. Set `include_output=True` to receive full output immediately, or call `get_execution_details(execution_id, host_names=["router1"])` afterward. Details can also be paginated with `offset` and `limit` (1–200); their summary/status always describe the original whole execution. Fetching details does not rerun the operation.
 
@@ -172,6 +172,26 @@ Run the MCP tool `diagnose_setup` before using device operations. It reports the
 Diagnosis performs no network requests: it loads local SimpleInventory files directly, skips inventory transforms, and does not load NetBox or custom inventory backends. Remote checks are marked as skipped; `hosts_checked` is null. It checks whether NB_TOKEN is configured without displaying it. Connectivity and credential validity must be checked separately with an explicitly selected read operation.
 
 For MCP clients that accept `mcpServers` JSON, copy `examples/mcp-client.json` and replace both absolute paths. Ensure the client can find `uv`, or use its absolute executable path. This example starts the server over stdio; no API credentials belong in the chat.
+
+## Fixed inspections for mixed-vendor inventories
+
+`get_inspection_presets` lists available inspections and commands. `run_inspection(inspection="os_version" | "interfaces", filter_criteria=..., include_output=True)` selects the command separately for each host using its effective Netmiko connection platform. Non-empty filters or explicit `all_hosts=True` are required. These tools only execute their fixed read-only commands; they do not accept arbitrary commands or deploy configuration.
+
+| Platform | OS information | Interface overview |
+|---|---|---|
+| Cisco IOS / IOS XE | `show version` | `show interfaces description` |
+| Cisco NX-OS | `show version` | `show interface brief` |
+| Cisco IOS XR | `show version` | `show interfaces description` |
+| Juniper Junos | `show version` | `show interfaces terse` |
+| Arista EOS | `show version` | `show interfaces status` |
+
+Nornir platform aliases and the corresponding Telnet drivers use the same dialect; serial presets are not supported. Unsupported hosts return `unsupported_platform` without sending a command; other hosts continue, with a whole-run partial-failure summary when appropriate. Recognized CLI rejection messages return `command_rejected`.
+
+Each successful output contains the inspection, selected platform/command, `parsed`, common `facts` and original `data`. TextFSM parsing is best effort: unavailable parsers preserve raw text with `parsed=False` and empty facts (this can occur for Junos terse output). Parsed OS facts use version/model/hostname; interface facts use name/status/protocol/description. Missing fields are null and native interface states are preserved rather than guessed. As with other task tools, output is omitted unless `include_output=True`, and can be retrieved through `get_execution_details`.
+
+Example: `run_inspection(inspection="interfaces", filter_criteria={"site": "tokyo"}, include_output=True)` can inspect supported Cisco, Juniper and Arista hosts together. The existing `run_netmiko_config` still sends the same configuration command list to all matching hosts; configuration generation is not automatically routed to deployment.
+
+Command references: [Cisco NX-OS](https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus9000/sw/7-x/command_references/show_commands/b_N9K_Show_Commands_703i4x/b_N9K_Show_Commands_703i4x_chapter_01001.html), [Cisco IOS XR](https://www.cisco.com/c/en/us/td/docs/iosxr/cisco8000/Interfaces/b-interfaces-hardware-component-cr-8000/global-interface-commands.html), [Junos](https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/topic-map/operational-commands.html), [Arista EOS](https://www.arista.com/en/um-eos/eos-ethernet-ports?tmpl=component).
 
 ## Testing
 
