@@ -91,11 +91,13 @@ def patched_nornir(monkeypatch):
 
 # Every tool that opens connections: (callable, kwargs needed to invoke it).
 CONNECTION_TOOLS = [
-    pytest.param(run_netmiko_command, {"command": "show version"}, id="run_netmiko_command"),
-    pytest.param(run_http_request, {"method": "GET", "path": "/api"}, id="run_http_request"),
-    pytest.param(run_serial_command, {"command": "show version"}, id="run_serial_command"),
-    pytest.param(generate_config, {"template_string": "hostname {{ host.name }}"}, id="generate_config"),
-    pytest.param(run_netmiko_config, {"commands": ["hostname r1"]}, id="run_netmiko_config"),
+    pytest.param(run_netmiko_command, {"command": "show version", "all_hosts": True}, id="run_netmiko_command"),
+    pytest.param(run_http_request, {"method": "GET", "path": "/api", "all_hosts": True}, id="run_http_request"),
+    pytest.param(run_serial_command, {"command": "show version", "all_hosts": True}, id="run_serial_command"),
+    pytest.param(
+        generate_config, {"template_string": "hostname {{ host.name }}", "all_hosts": True}, id="generate_config"
+    ),
+    pytest.param(run_netmiko_config, {"commands": ["hostname r1"], "all_hosts": True}, id="run_netmiko_config"),
 ]
 
 
@@ -417,7 +419,7 @@ class TestToolRunnerArguments:
         agg_result = _build_agg_result(Result(host=None, result="ok"))
         nr = patched_nornir(FakeNornir(hosts={"r1": _fake_host(), "r2": _fake_host()}, agg_result=agg_result))
 
-        generate_config("hostname {{ host.name }}")
+        generate_config("hostname {{ host.name }}", all_hosts=True)
 
         # Compiled exactly once for a two-host run, and handed to the task already
         # compiled, so the task cannot re-parse it per host.
@@ -430,7 +432,7 @@ class TestToolRunnerArguments:
         """A malformed template fails at compile time, before any host task is dispatched."""
         nr = patched_nornir(FakeNornir(hosts={"r1": _fake_host(), "r2": _fake_host()}))
 
-        output = generate_config("hostname {{ unclosed")
+        output = generate_config("hostname {{ unclosed", all_hosts=True)
 
         assert output.startswith("Error generating config:")
         assert nr.run_calls == []
@@ -459,7 +461,7 @@ class TestHttpClientFanOut:
         agg_result = _build_agg_result(Result(host=None, result="ok"))
         patched_nornir(FakeNornir(hosts=hosts, agg_result=agg_result))
 
-        run_http_request("GET", "/api")
+        run_http_request("GET", "/api", all_hosts=True)
 
         assert sorted(client.verify for client in created) == [False, True]
         assert all(client.closed for client in created)
@@ -483,7 +485,7 @@ class TestHttpClientFanOut:
         monkeypatch.setattr(server.httpx, "Client", create_client)
         nr = patched_nornir(FakeNornir(hosts={"r1": _fake_host(), "r2": _fake_host(tls_verify=False)}))
 
-        output = run_http_request("GET", "/api")
+        output = run_http_request("GET", "/api", all_hosts=True)
 
         assert "client initialization failed" in output
         assert created[0].closed is True
@@ -510,7 +512,7 @@ class TestHttpClientFanOut:
             )
         )
 
-        output = run_http_request("GET", "/api")
+        output = run_http_request("GET", "/api", all_hosts=True)
 
         assert "client close failed" in output
         assert all(client.closed for client in created)
@@ -565,7 +567,7 @@ class TestInheritedHostData:
             FakeNornir(hosts={host.name: host}, agg_result=_build_agg_result(Result(host=None, result="ok")))
         )
 
-        run_http_request("GET", "/api")
+        run_http_request("GET", "/api", all_hosts=True)
 
         assert created == [False]
 
@@ -628,7 +630,7 @@ def test_failed_nornir_hosts_have_their_connections_closed(monkeypatch):
     monkeypatch.setattr(server, "_get_nornir", lambda *args, **kwargs: nr)
     monkeypatch.setattr(server, "netmiko_send_command", command_task)
 
-    output = json.loads(run_netmiko_command("show version"))
+    output = json.loads(run_netmiko_command("show version", all_hosts=True))
 
     assert output["healthy"] == {"output": "ok"}
     assert output["failed"] == {"error": "command failed after connecting"}
