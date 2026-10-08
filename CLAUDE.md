@@ -58,7 +58,7 @@ Both are gitignored — they hold device credentials.
 
 ### Config resolution
 
-`CONFIG_FILE` is resolved once at import time from `NORNIR_MCP_CONFIG`, falling back to `config.yaml` **next to `server.py`** (not the process CWD). This matters because MCP clients launch the server from arbitrary working directories. Note that `config.yaml` itself points at `hosts.yaml` / `groups.yaml` by relative path, which Nornir resolves against the CWD — so a config outside the repo needs absolute inventory paths.
+`CONFIG_FILE` is resolved once at import time from `NORNIR_MCP_CONFIG`, falling back to `config.yaml` **next to `server.py`** (not the process CWD). This matters because MCP clients launch the server from arbitrary working directories. `_load_config` normalizes relative SimpleInventory host/group/default paths against the configuration directory, including implicit default filenames. NetBoxInventory2 local group/default paths follow the same rule; other plugins keep their own semantics. `_get_nornir` passes the resolved configuration to InitNornir.
 
 `config.yaml` is **tracked in git**, unlike `hosts.yaml` / `groups.yaml` / `defaults.yaml` (all gitignored). No credential ever goes in it: the NetBox inventory plugin reads `NB_URL` / `NB_TOKEN` from the environment, and device logins live in the gitignored inventory files.
 
@@ -93,3 +93,5 @@ Every `@mcp.tool()` that *runs tasks against hosts* follows the same shape, and 
 ## Docs and CI
 
 `README.md` (English) and `README.ja.md` (Japanese) are kept in sync — a change to the tool list, arguments, or setup steps must land in both. Pushes to `main` build and publish `ghcr.io/nagayon-935/nornir-mcp-server:latest` via `.github/workflows/docker-publish.yml`; the Dockerfile copies only `server.py`, so config and inventory are expected to be bind-mounted into `/app`.
+
+`diagnose_setup` performs offline checks only: load SimpleInventory files directly, never execute inventory transforms or initialize remote backends. Omit raw parser exceptions and credential values from its report. `examples/mcp-client.json` is a stdio setup example for clients that accept mcpServers JSON.

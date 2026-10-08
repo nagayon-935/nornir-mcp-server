@@ -41,7 +41,7 @@ By default the config file is loaded from `config.yaml` next to `server.py`, but
 export NORNIR_MCP_CONFIG=/path/to/config.yaml
 ```
 
-Only the config file path is resolved this way. The `host_file` / `group_file` paths **inside** that config are resolved by Nornir against the process's current working directory, so a config stored outside the repository must use absolute inventory paths.
+For `SimpleInventory`, relative `host_file`, `group_file` and `defaults_file` paths are resolved relative to the configuration file, including their default filenames. For `NetBoxInventory2`, the same applies to its local group/default files. Absolute paths are preserved. Other inventory plugins retain their own path semantics.
 
 `hosts.yaml` / `groups.yaml` / `defaults.yaml` contain device credentials and are gitignored. Copy them from the templates:
 
@@ -164,6 +164,14 @@ The five task-running tools return structured MCP objects instead of JSON string
 By default, `include_output=False` returns host statuses and errors without successful command output. Set `include_output=True` to receive full output immediately, or call `get_execution_details(execution_id, host_names=["router1"])` afterward. Details can also be paginated with `offset` and `limit` (1–200); their summary/status always describe the original whole execution. Fetching details does not rerun the operation.
 
 Results live in this server process for up to 15 minutes, with limits of 100 runs and 16 MiB total serialized data. Older results may be evicted earlier; restarting the server clears the cache. Outputs larger than the cache limit are returned immediately with `details_available=False`. A cleanup failure preserves completed task results and returns `cleanup_failed`; inspect the result before repeating a configuration change. Inventory discovery tools retain their own inventory-specific result formats.
+
+## Offline setup diagnosis
+
+Run the MCP tool `diagnose_setup` before using device operations. It reports the resolved config and inventory paths, invalid YAML/group references, credential placeholders, missing SSH/serial credentials, unsupported drivers and invalid HTTP settings. The report contains check codes and suggested fixes, never credential values or YAML parser excerpts. Missing optional group/default files produce warnings.
+
+Diagnosis performs no network requests: it loads local SimpleInventory files directly, skips inventory transforms, and does not load NetBox or custom inventory backends. Remote checks are marked as skipped; `hosts_checked` is null. It checks whether NB_TOKEN is configured without displaying it. Connectivity and credential validity must be checked separately with an explicitly selected read operation.
+
+For MCP clients that accept `mcpServers` JSON, copy `examples/mcp-client.json` and replace both absolute paths. Ensure the client can find `uv`, or use its absolute executable path. This example starts the server over stdio; no API credentials belong in the chat.
 
 ## Testing
 
