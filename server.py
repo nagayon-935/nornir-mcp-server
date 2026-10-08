@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 from collections import Counter, OrderedDict
 from contextlib import ExitStack
 from importlib.metadata import entry_points
@@ -16,12 +17,14 @@ import httpx
 from jinja2 import Template
 from jinja2.sandbox import SandboxedEnvironment
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 from netmiko import ConnectHandler
 from netmiko.exceptions import NetmikoAuthenticationException, NetmikoTimeoutException
 from netmiko.ssh_dispatcher import CLASS_MAPPER
 from nornir import InitNornir
 from nornir.core import Nornir
 from nornir.core.configuration import Config
+from nornir.core.exceptions import NornirSubTaskError
 from nornir.core.filter import F
 from nornir.core.inventory import Host
 from nornir.core.task import AggregatedResult, Result, Task
@@ -84,6 +87,39 @@ _MAX_RESULT_BYTES = 16 * 1024 * 1024
 _RESULT_CACHE: OrderedDict[str, tuple[float, int, ExecutionReport]] = OrderedDict()
 _RESULT_LOCK = Lock()
 
+_INSPECTIONS = {
+    "os_version": {
+        "title": "OS version and hardware information",
+        "commands": {
+            platform: "show version"
+            for platform in ("cisco_ios", "cisco_nxos", "cisco_xr", "juniper_junos", "arista_eos")
+        },
+    },
+    "interfaces": {
+        "title": "Interface status overview",
+        "commands": {
+            "cisco_ios": "show interfaces description",
+            "cisco_nxos": "show interface brief",
+            "cisco_xr": "show interfaces description",
+            "juniper_junos": "show interfaces terse",
+            "arista_eos": "show interfaces status",
+        },
+    },
+}
+_CLI_ERROR = re.compile(
+    r"^\s*(?:%\s*(?:Invalid input|Invalid command|Unrecognized command|Error|Access denied)|"
+    r"(?:error|syntax error|permission denied):)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+class UnsupportedInspectionPlatform(ValueError):
+    pass
+
+
+class InspectionCommandError(ValueError):
+    pass
+
 
 def _purge_results(now: float) -> None:
     """Caller holds _RESULT_LOCK; expiry follows creation, independent of LRU order."""
@@ -93,8 +129,20 @@ def _purge_results(now: float) -> None:
 
 
 def _error_detail(error: Exception | None, message: str) -> ErrorDetail:
+    if isinstance(error, NornirSubTaskError):
+        failed = next((result for result in error.result if result.failed), None)
+        if failed is not None:
+            detail = str(failed.exception) if failed.exception else str(failed.result)
+            return _error_detail(failed.exception, detail)
     code, hint = "execution_error", "Check the operation and server configuration."
-    if isinstance(error, NetmikoAuthenticationException):
+    if isinstance(error, UnsupportedInspectionPlatform):
+        code, hint = (
+            "unsupported_platform",
+            "Use get_inspection_presets to find supported platforms. No command was sent.",
+        )
+    elif isinstance(error, InspectionCommandError):
+        code, hint = "command_rejected", "Check command availability and permissions for this device's OS version."
+    elif isinstance(error, NetmikoAuthenticationException):
         code, hint = "authentication_failed", "Check the device credentials and account permissions."
     elif isinstance(error, (NetmikoTimeoutException, httpx.TimeoutException)):
         code, hint = "timeout", "Check device reachability and the configured timeout."
@@ -145,8 +193,15 @@ def _tool_error(
                     "error": report["error"],
                     "message": report["message"],
                 }
-                _RESULT_CACHE[report["execution_id"]] = (entry[0], entry[1], full_report)
-        return report
+                size = len(json.dumps(full_report).encode())
+                _RESULT_CACHE[report["execution_id"]] = (entry[0], size, full_report)
+                while _RESULT_CACHE and sum(item[1] for item in _RESULT_CACHE.values()) > _MAX_RESULT_BYTES:
+                    _RESULT_CACHE.popitem(last=False)
+                if report["execution_id"] not in _RESULT_CACHE:
+                    report["execution_id"] = None
+                    report["details_available"] = False
+                    report["results"] = full_report["results"]
+        return json.loads(json.dumps(report))
     report = _empty_report("failed", started)
     report["error"] = _error_detail(error, str(error))
     return report
@@ -556,12 +611,17 @@ def _format_agg_result(
             include_output = True
     if include_output:
         return json.loads(json.dumps(report))
-    return {
-        **report,
-        "results": {
-            name: {k: v for k, v in result.items() if k != "output"} for name, result in report["results"].items()
-        },
-    }
+    return json.loads(
+        json.dumps(
+            {
+                **report,
+                "results": {
+                    name: {k: v for k, v in result.items() if k != "output"}
+                    for name, result in report["results"].items()
+                },
+            }
+        )
+    )
 
 
 @mcp.tool()
@@ -962,6 +1022,115 @@ def generate_config(
             return report
     except Exception as e:
         return _tool_error("generating config", e, started, report)
+
+
+def _inspection_platform(host: Host) -> str | None:
+    params = host.get_connection_parameters("netmiko")
+    device_type = (params.extras or {}).get("device_type") or napalm_to_netmiko_map.get(
+        params.platform, params.platform
+    )
+    if isinstance(device_type, str):
+        device_type = device_type.removesuffix("_telnet")
+    return "cisco_ios" if device_type == "cisco_xe" else device_type
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))
+def get_inspection_presets() -> dict[str, Any]:
+    """List available fixed read-only inspections, supported platforms and the commands they use.
+
+    Cisco XE uses the IOS presets. Nornir aliases ios/nxos/iosxr/junos/eos and the
+    supported platforms' Telnet drivers use the corresponding platform presets.
+    Inspections do not accept arbitrary commands or automatically change device config.
+    """
+    return {
+        "inspections": [
+            {"name": name, "title": entry["title"], "commands": dict(entry["commands"])}
+            for name, entry in _INSPECTIONS.items()
+        ]
+    }
+
+
+def _inspection_facts(inspection: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Expose common field names without guessing missing states or versions."""
+    if inspection == "os_version":
+        mappings = {
+            "version": ("version", "junos_version", "os", "image"),
+            "model": ("model", "hardware", "platform"),
+            "hostname": ("hostname",),
+        }
+    else:
+        mappings = {
+            "name": ("interface", "port"),
+            "status": ("status",),
+            "protocol": ("protocol",),
+            "description": ("description", "name"),
+        }
+    normalized = []
+    for row in rows:
+        lowered = {key.lower(): value for key, value in row.items()}
+        normalized.append(
+            {
+                field: next((lowered[key] for key in keys if lowered.get(key) not in (None, "", [])), None)
+                for field, keys in mappings.items()
+            }
+        )
+    return normalized
+
+
+def custom_inspection_task(task: Task, inspection: str, use_textfsm: bool = True) -> Result:
+    platform = _inspection_platform(task.host)
+    command = _INSPECTIONS[inspection]["commands"].get(platform)
+    if command is None:
+        raise UnsupportedInspectionPlatform("No preset is available for this host's configured connection platform.")
+    result = task.run(task=netmiko_send_command, command_string=command, use_textfsm=use_textfsm)
+    output = result[0].result
+    if isinstance(output, str) and _CLI_ERROR.search(output):
+        raise InspectionCommandError("The device rejected the inspection command.")
+    parsed = isinstance(output, list) and all(isinstance(row, dict) for row in output)
+    return Result(
+        host=task.host,
+        result={
+            "inspection": inspection,
+            "platform": platform,
+            "command": command,
+            "parsed": parsed,
+            "facts": _inspection_facts(inspection, output) if parsed else [],
+            "data": output,
+        },
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False))
+def run_inspection(
+    inspection: Literal["os_version", "interfaces"],
+    filter_criteria: dict[str, Any] | None = None,
+    all_hosts: bool = False,
+    use_textfsm: bool = True,
+    include_output: bool = False,
+) -> ExecutionReport:
+    """Inspect OS versions or interface status with a fixed command selected per device platform.
+
+    Works across supported Netmiko SSH/Telnet platforms in the same run. Unsupported
+    hosts fail without sending a command, while supported hosts continue. Requires
+    filter_criteria or all_hosts=True. include_output=True returns observations now;
+    otherwise retrieve them with get_execution_details. TextFSM parsing is best effort:
+    parsed=False retains raw text and leaves facts empty. No automatic retries.
+    """
+    started = monotonic()
+    report = None
+    try:
+        if inspection not in _INSPECTIONS:
+            raise ValueError("Supported inspection names are os_version and interfaces.")
+        with _target_nornir(filter_criteria, all_hosts) as nr:
+            if not nr.inventory.hosts:
+                return _empty_report("no_hosts", started)
+            results = nr.run(
+                task=custom_inspection_task, inspection=inspection, use_textfsm=use_textfsm, raise_on_error=False
+            )
+            report = _format_agg_result(results, include_output, started)
+            return report
+    except Exception as error:
+        return _tool_error("running inspection", error, started, report)
 
 
 @mcp.tool()

@@ -153,13 +153,13 @@ Jinja2 テンプレート（サンドボックス環境で実行）を用いて�
 
 `preview_targets(filter_criteria, offset=0, limit=50)` は、実機へ接続せずに対象の機器名・接続先・機種・グループ・件数を返します。機器名順にページ分割され、limit は 1〜200 です。認証情報は返しません。プレビューは現在の台帳を参照するもので、後の実行対象を固定するものではありません。
 
-タスクを実行する5つのツールには、空でない `filter_criteria`、または明示的な `all_hosts=True` が必要になりました。両方を省略すると台帳の読み込み前にエラーを返します。空でないフィルターを指定した場合は、`all_hosts=True` でも対象を絞り込みます。
+タスクを実行するツールには、空でない `filter_criteria`、または明示的な `all_hosts=True` が必要になりました。両方を省略すると台帳の読み込み前にエラーを返します。空でないフィルターを指定した場合は、`all_hosts=True` でも対象を絞り込みます。
 
 例：候補を確認 → `{"site": "tokyo", "role": "core"}` で対象をプレビュー → `run_netmiko_command(command="show version", filter_criteria={"site": "tokyo", "role": "core"})` を実行。NetBox では候補に含まれる入れ子のフィルターを使ってください。
 
 ## 構造化された実行結果
 
-タスクを実行する5つのツールは、JSON文字列に代わって構造化されたMCPオブジェクトを返します。`status`（`success`・`partial_failure`・`failed`・`no_hosts`）、`execution_id`、`summary`（総件数・成功件数・失敗件数・所要秒数）、機器ごとの `results` が含まれます。エラーには機械判読用の `code`・メッセージ・確認先の案内が入り、認証失敗・タイムアウト・HTTPエラーを区別できます。自動再実行は行いません。
+タスクを実行するツールは、JSON文字列に代わって構造化されたMCPオブジェクトを返します。`status`（`success`・`partial_failure`・`failed`・`no_hosts`）、`execution_id`、`summary`（総件数・成功件数・失敗件数・所要秒数）、機器ごとの `results` が含まれます。エラーには機械判読用の `code`・メッセージ・確認先の案内が入り、認証失敗・タイムアウト・HTTPエラーを区別できます。自動再実行は行いません。
 
 既定の `include_output=False` では機器ごとの状態とエラーを返し、成功したコマンドの詳細出力を省略します。すぐに詳細も受け取る場合は `include_output=True` を指定してください。後から `get_execution_details(execution_id, host_names=["router1"])` で特定の機器の出力を取得することもできます。`offset`・`limit`（1〜200）によるページ分割にも対応し、summary/status は常に元の実行全体を表します。詳細取得で処理を再実行することはありません。
 
@@ -172,6 +172,26 @@ Jinja2 テンプレート（サンドボックス環境で実行）を用いて�
 診断中はネットワークアクセスを行いません。ローカルのSimpleInventoryファイルを直接読み込み、インベントリの変換処理は実行せず、NetBoxや独自の外部インベントリも読み込みません。外部台帳の確認はスキップとして表示し、`hosts_checked` はnullです。NB_TOKENの設定有無のみ確認し、値は表示しません。実際の疎通や認証の有効性は、対象を明示した照会操作で別途確認してください。
 
 `mcpServers` 形式のJSONを受け付けるMCPクライアントでは、`examples/mcp-client.json` をコピーして2か所の絶対パスを置き換えて使えます。クライアントから `uv` を見つけられるようにするか、実行ファイルの絶対パスを指定してください。標準入出力で起動する例であり、APIの認証情報をチャットに入力する必要はありません。
+
+## マルチベンダー環境での定型照会
+
+`get_inspection_presets` で照会の種類とコマンドを確認できます。`run_inspection(inspection="os_version" | "interfaces", filter_criteria=..., include_output=True)` は、各ホストの実際のNetmiko接続設定の機種に合わせて個別にコマンドを選びます。空でないフィルター、または明示的な `all_hosts=True` が必要です。定義済みの照会コマンドのみ実行し、任意のコマンドや設定投入は受け付けません。
+
+| 機種 | OS情報 | インターフェース概要 |
+|---|---|---|
+| Cisco IOS / IOS XE | `show version` | `show interfaces description` |
+| Cisco NX-OS | `show version` | `show interface brief` |
+| Cisco IOS XR | `show version` | `show interfaces description` |
+| Juniper Junos | `show version` | `show interfaces terse` |
+| Arista EOS | `show version` | `show interfaces status` |
+
+Nornirの機種別名と対応するTelnetドライバも同じコマンドを使います。シリアルの定型照会は未対応です。未対応の機種にはコマンドを送らず `unsupported_platform` を返し、他の機器の照会は続けます。必要に応じて実行全体は部分失敗として報告します。認識できるCLIの拒否メッセージには `command_rejected` を返します。
+
+成功時の詳細には照会の種類、選んだ機種・コマンド、`parsed`、共通の `facts`、元の `data` が含まれます。TextFSMによる解析は可能な場合に行い、対応するパーサーがなければ生のテキストを維持し、`parsed=False`、factsは空になります（Junosのterse出力など）。解析できたOS情報はversion/model/hostname、インターフェース情報はname/status/protocol/descriptionとして返します。欠けている値はnullとし、機種固有の状態値は推測で変換しません。他の実行ツールと同様に、詳細をその場で返すには `include_output=True` が必要です。後から `get_execution_details` でも取得できます。
+
+例：`run_inspection(inspection="interfaces", filter_criteria={"site": "tokyo"}, include_output=True)` では、対応するCisco・Juniper・Arista機器を一度に照会できます。既存の `run_netmiko_config` は引き続き同じコマンド列を対象の全機器へ送る方式であり、生成したコンフィグの自動振り分け・投入は行いません。
+
+コマンドの参照先：[Cisco NX-OS](https://www.cisco.com/c/en/us/td/docs/switches/datacenter/nexus9000/sw/7-x/command_references/show_commands/b_N9K_Show_Commands_703i4x/b_N9K_Show_Commands_703i4x_chapter_01001.html)、[Cisco IOS XR](https://www.cisco.com/c/en/us/td/docs/iosxr/cisco8000/Interfaces/b-interfaces-hardware-component-cr-8000/global-interface-commands.html)、[Junos](https://www.juniper.net/documentation/us/en/software/junos/cli-reference/topics/topic-map/operational-commands.html)、[Arista EOS](https://www.arista.com/en/um-eos/eos-ethernet-ports?tmpl=component)。
 
 ## テスト
 
