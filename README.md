@@ -116,6 +116,7 @@ The following tools are currently exposed to AI agents.
 ### `get_inventory`
 Returns the hosts and their metadata from the current inventory, optionally filtered.
 * **Args**: `filter_criteria` (e.g. `{"site": "tokyo"}`)
+* Returned `data` includes values inherited from groups and defaults; host values take precedence.
 
 ### `run_netmiko_command`
 Runs a `show`-style command in parallel across the filtered target devices.
@@ -125,11 +126,13 @@ Runs a `show`-style command in parallel across the filtered target devices.
 Sends an HTTP request to the REST API endpoint of each filtered target device.
 * **Args**: `method` (GET/POST/etc.), `path` (API path), `filter_criteria`, `json_data`
 * Configure the target host's inventory data (`host.data`) with `base_url` (e.g. `https://192.168.1.1`), `http_headers`, `tls_verify` (True/False), and `http_timeout` (seconds, defaults to 10) as needed.
+* These settings can also be defined in group or default data. Host values override inherited values.
 
 ### `run_serial_command`
 Runs a command over a direct serial connection (console cable, etc.). Physical ports can only be held by one process at a time, so even with multiple target hosts, they are always processed one at a time (never in parallel).
 * **Args**: `command` (the CLI command to run), `filter_criteria`
 * The target host's inventory data must include `serial_settings` (port, baudrate, etc.). Netmiko's serial drivers require a `device_type` ending in `_serial`, so either set `serial_settings.device_type` explicitly, or leave it unset and it will be derived by appending `_serial` to `host.platform` (e.g. `cisco_ios`).
+* `serial_settings` can also be inherited from group or default data.
 * The derivation is not validated against Netmiko's driver table, and Netmiko only ships serial drivers for a subset of platforms. A platform with no matching `*_serial` driver (e.g. `arista_eos` → `arista_eos_serial`) fails with `Unsupported device_type`; set `serial_settings.device_type` explicitly in that case.
 * Login uses the **top-level** `username` / `password` fields from `hosts.yaml` / `groups.yaml` / `defaults.yaml`. It does **not** read `connection_options.netmiko.extras` (which is used for SSH connections), so if you also use serial connections, set credentials at the top level too — `groups.yaml.example` ships both. All three files are gitignored.
 
@@ -137,6 +140,7 @@ Runs a command over a direct serial connection (console cable, etc.). Physical p
 Renders a Jinja2 template (in a sandboxed environment) to generate configuration. Does **not** deploy it — useful for dry runs and auditing.
 * **Args**: `template_string` (a Jinja2 template), `filter_criteria`
 * Only `{{ host.name }}`, `{{ host.hostname }}`, `{{ host.platform }}`, `{{ host.groups }}`, and `{{ host.data['key'] }}` are available inside the template. Other host attributes (such as credentials) are intentionally not exposed.
+* `host.data` includes values inherited from groups and defaults; host values take precedence. Data fields are exposed as provided, so avoid placing secrets in data used by inventory queries or templates.
 
 ### `run_netmiko_config`
 ⚠️ **This is a destructive operation that changes device configuration.** Deploys the given configuration commands (or a generated config) to the target devices in parallel.

@@ -116,6 +116,7 @@ docker run -i --rm \
 ### `get_inventory`
 現在のインベントリから、条件に合致するホスト一覧とメタデータを取得します。
 * **引数**: `filter_criteria` (例: `{"site": "tokyo"}`)
+* 返却する `data` にはグループ・デフォルトから継承した値も含まれます。ホストに定義した値を優先します。
 
 ### `run_netmiko_command`
 フィルタリングされた対象機器群に対して、並列で `show` 系コマンドを実行します。
@@ -125,11 +126,13 @@ docker run -i --rm \
 フィルタリングされた対象機器群の REST API エンドポイントに HTTP リクエストを実行します。
 * **引数**: `method` (GET/POST等), `path` (APIパス), `filter_criteria`, `json_data`
 * 対象ホストのインベントリデータ (`host.data`) に `base_url` (例: `https://192.168.1.1`), `http_headers`, `tls_verify` (True/False), `http_timeout` (秒数、既定は 10) 等の情報を記載して利用します。
+* これらの設定はグループ・デフォルトのデータにも定義できます。ホストに定義した値は継承した値より優先されます。
 
 ### `run_serial_command`
 直接シリアル接続（コンソールケーブル等）を用いてコマンドを実行します。物理ポートは同時に1つのプロセスからしか使えないため、対象が複数ホストでも常に1台ずつ順番に処理されます（並列実行しません）。
 * **引数**: `command` (実行するコマンド), `filter_criteria`
 * 対象ホストのインベントリデータに `serial_settings` (port, baudrate 等) の記載が必要です。Netmiko のシリアルドライバは `device_type` の末尾が `_serial` である必要があるため、`serial_settings.device_type` を明示するか、未指定の場合は `host.platform`（例: `cisco_ios`）に自動で `_serial` を付与します。
+* `serial_settings` はグループ・デフォルトのデータからも継承できます。
 * この自動付与は Netmiko のドライバ一覧と照合されません。Netmiko がシリアルドライバを提供しているプラットフォームは一部のみのため、対応するドライバが無い場合（例: `arista_eos` → `arista_eos_serial`）は `Unsupported device_type` で失敗します。その場合は `serial_settings.device_type` を明示してください。
 * ログイン認証には `hosts.yaml` / `groups.yaml` / `defaults.yaml` の**トップレベル**の `username` / `password` を使用します。`connection_options.netmiko.extras` 配下の値（SSH接続用）は参照しないため、シリアル接続も使う場合はトップレベルにも認証情報を設定してください（`groups.yaml.example` には両方を記載済みです）。これら3ファイルはいずれも `.gitignore` 対象です。
 
@@ -137,6 +140,7 @@ docker run -i --rm \
 Jinja2 テンプレート（サンドボックス環境で実行）を用いて、コンフィグを動的生成します。（実機への適用は行いません）
 * **引数**: `template_string` (Jinja2テンプレート), `filter_criteria`
 * テンプレート内で参照できるのは `{{ host.name }}`, `{{ host.hostname }}`, `{{ host.platform }}`, `{{ host.groups }}`, `{{ host.data['key'] }}` のみです。認証情報などその他の属性は意図的に公開されません。
+* `host.data` にはグループ・デフォルトから継承した値も含まれ、ホストに定義した値を優先します。データの内容はそのまま公開されるため、インベントリ照会やテンプレートで使うデータに秘密情報を含めないでください。
 
 ### `run_netmiko_config`
 ⚠️ **実機の設定を変更する破壊的な操作です。** 生成したコンフィグや指定のコマンドリストを、対象機器に並列で設定投入 (Config Deploy) します。
