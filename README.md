@@ -6,14 +6,13 @@ English | [日本語](README.ja.md)
 
 Rather than the traditional "iterate over every device in a list" approach, it lets an AI agent leverage Nornir's metadata-based filtering (`nornir.filter`) to autonomously select targets — e.g. "only the core routers in Tokyo" — and run tasks against them in parallel.
 
-## Current Status
-* **Phase 1, 2, 3 complete (full feature set)**
-  * `SimpleInventory` (YAML) and NetBox (`nornir_netbox`) support
-  * Parallel execution of `show` commands (SSH/Telnet)
-  * REST API request execution (via `httpx`)
-  * Direct serial connection support to hosts (`netmiko` serial mode)
-  * Dynamic config generation with Jinja2
-  * Deploying configuration to real devices (Config Deploy)
+## Capabilities
+* `SimpleInventory` (YAML) and NetBox (`nornir_netbox`) support
+* Parallel execution of `show` commands (SSH/Telnet)
+* REST API request execution (via `httpx`)
+* Direct serial connection support to hosts (`netmiko` serial mode)
+* Dynamic config generation with Jinja2
+* Deploying configuration to real devices (Config Deploy)
 
 ## Key Features
 * **Flexible inventory**: Uses Nornir's plugin ecosystem as-is — the standard `SimpleInventory` (hosts.yaml / groups.yaml) rather than a custom format. Dynamic inventory from NetBox is also supported.
@@ -154,6 +153,13 @@ Unit tests live in `tests/`.
 ```bash
 uv sync
 uv run pytest tests/ -v
+```
+
+Lint and format with ruff:
+
+```bash
+uv run ruff check .
+uv run ruff format .
 ```
 
 ## License

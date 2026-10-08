@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from collections.abc import Callable
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,7 @@ CONFIG_FILE = Path(os.environ.get("NORNIR_MCP_CONFIG", str(Path(__file__).parent
 # Default per-request HTTP timeout; override per host with 'http_timeout' in host.data.
 HTTP_TIMEOUT = 10.0
 SERIAL_DEVICE_TYPE_SUFFIX = "_serial"
+NO_MATCH_MESSAGE = "No hosts matched the filter criteria."
 
 # Mirrors the direct imports above (and pyproject.toml): `mcp install` builds its
 # isolated environment from this list, so a missing entry breaks that path at import.
@@ -63,6 +65,31 @@ def _format_agg_result(agg_result: AggregatedResult) -> str:
         else:
             output_data[host_name] = {"output": multi_result[0].result}
     return json.dumps(output_data, indent=2, default=str)
+
+
+def _run_tool(
+    action: str,
+    filter_criteria: dict[str, Any] | None,
+    run: Callable[[Nornir, ExitStack], AggregatedResult],
+    *,
+    num_workers: int | None = None,
+    log_context: str = "",
+) -> str:
+    """Shared skeleton of every task-running tool.
+
+    Opens Nornir inside its context manager (which closes connections, failed hosts
+    included), short-circuits when nothing matches, and reports any failure as text.
+    `run` receives the filtered Nornir and an ExitStack for extra resources that must
+    be released on every path.
+    """
+    try:
+        with _get_nornir(filter_criteria, num_workers) as nr, ExitStack() as stack:
+            if not nr.inventory.hosts:
+                return NO_MATCH_MESSAGE
+            return _format_agg_result(run(nr, stack))
+    except Exception as e:
+        logger.exception(f"Error {action} ({log_context}filter={filter_criteria})")
+        return f"Error {action}: {str(e)}"
 
 
 def _host_metadata(host: Host) -> dict[str, Any]:
@@ -105,16 +132,12 @@ def run_netmiko_command(command: str, filter_criteria: dict[str, Any] | None = N
         filter_criteria: Dictionary of key-value pairs to filter target hosts. If empty, runs on ALL hosts!
         use_textfsm: If True, attempts to parse output into structured data using ntc-templates.
     """
-    try:
-        # Nornir's context manager also closes connections on failed hosts.
-        with _get_nornir(filter_criteria) as nr:
-            if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
-            agg_result = nr.run(task=netmiko_send_command, command_string=command, use_textfsm=use_textfsm)
-            return _format_agg_result(agg_result)
-    except Exception as e:
-        logger.exception(f"Error executing command (command={command!r}, filter={filter_criteria})")
-        return f"Error executing command: {str(e)}"
+    return _run_tool(
+        "executing command",
+        filter_criteria,
+        lambda nr, _: nr.run(task=netmiko_send_command, command_string=command, use_textfsm=use_textfsm),
+        log_context=f"command={command!r}, ",
+    )
 
 
 def _get_tls_verify(host: Host) -> bool:
@@ -176,24 +199,24 @@ def run_http_request(
     Per-host settings come from inventory data, including group/default inheritance:
     'base_url', 'http_headers', 'tls_verify', and 'http_timeout' (seconds, defaults to 10).
     """
-    try:
-        with _get_nornir(filter_criteria) as nr, ExitStack() as stack:
-            if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
 
-            # Register cleanup immediately, including for partial initialization.
-            # Clients are shared across threads, one per TLS verification setting.
-            verify_values = {_get_tls_verify(host) for host in nr.inventory.hosts.values()}
-            clients = {}
-            for verify in verify_values:
-                client = httpx.Client(verify=verify, timeout=HTTP_TIMEOUT)
-                stack.callback(client.close)
-                clients[verify] = client
-            agg_result = nr.run(task=custom_http_task, clients=clients, method=method, path=path, json_data=json_data)
-            return _format_agg_result(agg_result)
-    except Exception as e:
-        logger.exception(f"Error executing HTTP request (method={method}, path={path}, filter={filter_criteria})")
-        return f"Error executing HTTP request: {str(e)}"
+    def run(nr: Nornir, stack: ExitStack) -> AggregatedResult:
+        # Register cleanup immediately, including for partial initialization.
+        # Clients are shared across threads, one per TLS verification setting.
+        verify_values = {_get_tls_verify(host) for host in nr.inventory.hosts.values()}
+        clients = {}
+        for verify in verify_values:
+            client = httpx.Client(verify=verify, timeout=HTTP_TIMEOUT)
+            stack.callback(client.close)
+            clients[verify] = client
+        return nr.run(task=custom_http_task, clients=clients, method=method, path=path, json_data=json_data)
+
+    return _run_tool(
+        "executing HTTP request",
+        filter_criteria,
+        run,
+        log_context=f"method={method}, path={path}, ",
+    )
 
 
 def _resolve_serial_device_type(serial_settings: dict[str, Any], platform: str | None) -> str:
@@ -245,15 +268,13 @@ def run_serial_command(command: str, filter_criteria: dict[str, Any] | None = No
         command: The CLI command to execute (e.g., 'show version').
         filter_criteria: Dictionary to filter target hosts.
     """
-    try:
-        with _get_nornir(filter_criteria, num_workers=1) as nr:
-            if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
-            agg_result = nr.run(task=custom_serial_task, command=command)
-            return _format_agg_result(agg_result)
-    except Exception as e:
-        logger.exception(f"Error executing serial command (command={command!r}, filter={filter_criteria})")
-        return f"Error executing serial command: {str(e)}"
+    return _run_tool(
+        "executing serial command",
+        filter_criteria,
+        lambda nr, _: nr.run(task=custom_serial_task, command=command),
+        num_workers=1,
+        log_context=f"command={command!r}, ",
+    )
 
 
 def custom_template_task(task: Task, template: Template) -> Result:
@@ -283,18 +304,13 @@ def generate_config(template_string: str, filter_criteria: dict[str, Any] | None
                          host.data includes inherited group/default values.
         filter_criteria: Dictionary to filter target hosts.
     """
-    try:
-        with _get_nornir(filter_criteria) as nr:
-            if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
 
-            # Compile once for all hosts, inside the connection cleanup scope.
-            template = _JINJA_ENV.from_string(template_string)
-            agg_result = nr.run(task=custom_template_task, template=template)
-            return _format_agg_result(agg_result)
-    except Exception as e:
-        logger.exception(f"Error generating config (filter={filter_criteria})")
-        return f"Error generating config: {str(e)}"
+    def run(nr: Nornir, _: ExitStack) -> AggregatedResult:
+        # Compile once for all hosts, inside the connection cleanup scope.
+        template = _JINJA_ENV.from_string(template_string)
+        return nr.run(task=custom_template_task, template=template)
+
+    return _run_tool("generating config", filter_criteria, run)
 
 
 @mcp.tool()
@@ -308,15 +324,11 @@ def run_netmiko_config(commands: list[str], filter_criteria: dict[str, Any] | No
         commands: List of configuration commands to execute.
         filter_criteria: Dictionary to filter target hosts.
     """
-    try:
-        with _get_nornir(filter_criteria) as nr:
-            if not nr.inventory.hosts:
-                return "No hosts matched the filter criteria."
-            agg_result = nr.run(task=netmiko_send_config, config_commands=commands)
-            return _format_agg_result(agg_result)
-    except Exception as e:
-        logger.exception(f"Error executing config commands (filter={filter_criteria})")
-        return f"Error executing config commands: {str(e)}"
+    return _run_tool(
+        "executing config commands",
+        filter_criteria,
+        lambda nr, _: nr.run(task=netmiko_send_config, config_commands=commands),
+    )
 
 
 if __name__ == "__main__":
