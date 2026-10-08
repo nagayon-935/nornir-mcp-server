@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+from collections import Counter
 from contextlib import ExitStack
 from pathlib import Path
 from typing import Any
@@ -75,6 +76,90 @@ def _host_metadata(host: Host) -> dict[str, Any]:
     }
 
 
+def _target_nornir(filter_criteria: dict[str, Any] | None, all_hosts: bool, num_workers: int | None = None) -> Nornir:
+    """Require a deliberate selection before initializing any inventory backend."""
+    if not filter_criteria and not all_hosts:
+        raise ValueError("Target selection required: provide non-empty filter_criteria or set all_hosts=True.")
+    return _get_nornir(filter_criteria, num_workers=num_workers)
+
+
+def _inventory_choices(nr: Nornir) -> dict[str, list[dict[str, Any]]]:
+    """Only aggregate public selection fields, never arbitrary inventory data."""
+    choices = {}
+    for field in ("site", "role", "platform"):
+        counts = Counter()
+        for host in nr.inventory.hosts.values():
+            value = host.get(field)
+            filter_field = field
+            if isinstance(value, dict):
+                nested_field = "slug" if value.get("slug") else "name"
+                filter_field = f"{field}__{nested_field}"
+                value = value.get(nested_field)
+            if isinstance(value, str) and value:
+                counts[(filter_field, value)] += 1
+        choices[field] = [
+            {"value": value, "count": count, "filter_criteria": {filter_field: value}}
+            for (filter_field, value), count in sorted(counts.items())
+        ]
+    return choices
+
+
+@mcp.tool()
+def get_inventory_summary() -> dict[str, Any]:
+    """Discover registered site, role and platform values and host counts without connecting to devices.
+
+    For NetBox, site/role values are slugs from nested metadata; use site__slug/role__slug
+    in filters. For YAML string metadata, use site/role directly.
+    """
+    try:
+        nr = _get_nornir()
+        return {"status": "success", "total_hosts": len(nr.inventory.hosts), "choices": _inventory_choices(nr)}
+    except Exception:
+        logger.exception("Error summarizing inventory")
+        return {"status": "failed", "error": "Could not load inventory. Check the server configuration."}
+
+
+@mcp.tool()
+def preview_targets(filter_criteria: dict[str, Any] | None = None, offset: int = 0, limit: int = 50) -> dict[str, Any]:
+    """Preview matching hosts, counts and platforms without connecting to devices.
+
+    Empty filters preview all registered hosts. This is a live inventory preview, not
+    a reservation: execution reloads the inventory. limit must be between 1 and 200.
+    Only names, addresses, platforms and groups are returned; no credential data.
+    """
+    if offset < 0 or not 1 <= limit <= 200:
+        return {"status": "failed", "error": "offset must be non-negative and limit must be between 1 and 200."}
+    try:
+        nr = _get_nornir()
+        available_choices = _inventory_choices(nr)
+        if filter_criteria:
+            nr = nr.filter(F(**filter_criteria))
+        names = sorted(nr.inventory.hosts)
+        hosts = []
+        for name in names[offset : offset + limit]:
+            host = nr.inventory.hosts[name]
+            hosts.append(
+                {
+                    "name": name,
+                    "hostname": host.hostname,
+                    "platform": host.platform,
+                    "groups": [group.name for group in host.groups],
+                }
+            )
+        next_offset = offset + len(hosts)
+        return {
+            "status": "success" if names else "no_hosts",
+            "matched_hosts": len(names),
+            "hosts": hosts,
+            "next_offset": next_offset if next_offset < len(names) else None,
+            "choices": available_choices,
+            "platforms": _inventory_choices(nr)["platform"],
+        }
+    except Exception:
+        logger.exception("Error previewing targets (filter=%s)", filter_criteria)
+        return {"status": "failed", "error": "Could not load or filter inventory. Check the filter and configuration."}
+
+
 @mcp.tool()
 def get_inventory(filter_criteria: dict[str, Any] | None = None) -> str:
     """
@@ -96,18 +181,21 @@ def get_inventory(filter_criteria: dict[str, Any] | None = None) -> str:
 
 
 @mcp.tool()
-def run_netmiko_command(command: str, filter_criteria: dict[str, Any] | None = None, use_textfsm: bool = False) -> str:
+def run_netmiko_command(
+    command: str, filter_criteria: dict[str, Any] | None = None, use_textfsm: bool = False, all_hosts: bool = False
+) -> str:
     """
     Run a show command concurrently on multiple hosts via Netmiko.
 
     Args:
         command: The CLI command to execute (e.g., 'show version').
-        filter_criteria: Dictionary of key-value pairs to filter target hosts. If empty, runs on ALL hosts!
+        filter_criteria: Non-empty dictionary of key-value pairs to filter target hosts.
         use_textfsm: If True, attempts to parse output into structured data using ntc-templates.
+        all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
     """
     try:
         # Nornir's context manager also closes connections on failed hosts.
-        with _get_nornir(filter_criteria) as nr:
+        with _target_nornir(filter_criteria, all_hosts) as nr:
             if not nr.inventory.hosts:
                 return "No hosts matched the filter criteria."
             agg_result = nr.run(task=netmiko_send_command, command_string=command, use_textfsm=use_textfsm)
@@ -163,6 +251,7 @@ def run_http_request(
     path: str,
     filter_criteria: dict[str, Any] | None = None,
     json_data: dict | None = None,
+    all_hosts: bool = False,
 ) -> str:
     """
     Run an HTTP API request (REST) concurrently on multiple hosts.
@@ -172,12 +261,13 @@ def run_http_request(
         path: API path to request (e.g., '/api/v1/system').
         filter_criteria: Dictionary to filter target hosts.
         json_data: Optional JSON payload for POST/PUT requests.
+        all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
 
     Per-host settings come from inventory data, including group/default inheritance:
     'base_url', 'http_headers', 'tls_verify', and 'http_timeout' (seconds, defaults to 10).
     """
     try:
-        with _get_nornir(filter_criteria) as nr, ExitStack() as stack:
+        with _target_nornir(filter_criteria, all_hosts) as nr, ExitStack() as stack:
             if not nr.inventory.hosts:
                 return "No hosts matched the filter criteria."
 
@@ -234,7 +324,7 @@ def custom_serial_task(task: Task, command: str) -> Result:
 
 
 @mcp.tool()
-def run_serial_command(command: str, filter_criteria: dict[str, Any] | None = None) -> str:
+def run_serial_command(command: str, filter_criteria: dict[str, Any] | None = None, all_hosts: bool = False) -> str:
     """
     Run a CLI command on devices via direct Serial connection (using Netmiko).
 
@@ -244,9 +334,10 @@ def run_serial_command(command: str, filter_criteria: dict[str, Any] | None = No
     Args:
         command: The CLI command to execute (e.g., 'show version').
         filter_criteria: Dictionary to filter target hosts.
+        all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
     """
     try:
-        with _get_nornir(filter_criteria, num_workers=1) as nr:
+        with _target_nornir(filter_criteria, all_hosts, num_workers=1) as nr:
             if not nr.inventory.hosts:
                 return "No hosts matched the filter criteria."
             agg_result = nr.run(task=custom_serial_task, command=command)
@@ -271,7 +362,9 @@ def custom_template_task(task: Task, template: Template) -> Result:
 
 
 @mcp.tool()
-def generate_config(template_string: str, filter_criteria: dict[str, Any] | None = None) -> str:
+def generate_config(
+    template_string: str, filter_criteria: dict[str, Any] | None = None, all_hosts: bool = False
+) -> str:
     """
     Generate configuration from a Jinja2 template string for each target host.
     Does NOT deploy the configuration; useful for dry-runs and auditing.
@@ -282,9 +375,10 @@ def generate_config(template_string: str, filter_criteria: dict[str, Any] | None
                          attributes (e.g. credentials) are not exposed.
                          host.data includes inherited group/default values.
         filter_criteria: Dictionary to filter target hosts.
+        all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
     """
     try:
-        with _get_nornir(filter_criteria) as nr:
+        with _target_nornir(filter_criteria, all_hosts) as nr:
             if not nr.inventory.hosts:
                 return "No hosts matched the filter criteria."
 
@@ -298,7 +392,9 @@ def generate_config(template_string: str, filter_criteria: dict[str, Any] | None
 
 
 @mcp.tool()
-def run_netmiko_config(commands: list[str], filter_criteria: dict[str, Any] | None = None) -> str:
+def run_netmiko_config(
+    commands: list[str], filter_criteria: dict[str, Any] | None = None, all_hosts: bool = False
+) -> str:
     """
     WRITE OPERATION: modifies device configuration.
     Deploy configuration commands concurrently to multiple hosts via Netmiko.
@@ -307,9 +403,10 @@ def run_netmiko_config(commands: list[str], filter_criteria: dict[str, Any] | No
     Args:
         commands: List of configuration commands to execute.
         filter_criteria: Dictionary to filter target hosts.
+        all_hosts: Explicitly allow all hosts when filter_criteria is empty. Defaults to False.
     """
     try:
-        with _get_nornir(filter_criteria) as nr:
+        with _target_nornir(filter_criteria, all_hosts) as nr:
             if not nr.inventory.hosts:
                 return "No hosts matched the filter criteria."
             agg_result = nr.run(task=netmiko_send_config, config_commands=commands)

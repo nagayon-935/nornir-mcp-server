@@ -147,6 +147,16 @@ Renders a Jinja2 template (in a sandboxed environment) to generate configuration
 * **Args**: `commands` (list of configuration commands to deploy), `filter_criteria`
 * This is the only write path in the server. The tool description instructs the agent to confirm with you before calling it — keep a human in the loop for this tool.
 
+## Target discovery and explicit selection
+
+Before running an operation, use `get_inventory_summary` to discover site, role and platform values and counts. Each choice includes a ready-to-use `filter_criteria`; NetBox nested values use filters such as `site__slug`.
+
+`preview_targets(filter_criteria, offset=0, limit=50)` returns the matching host names, addresses, platforms, groups and counts without connecting to devices. Results are sorted by name and paginated (limit 1–200). It exposes no authentication data. The preview reads the current inventory; it does not reserve targets for a later operation.
+
+All five task-running tools now require a non-empty `filter_criteria`, or an explicit `all_hosts=True`. Omitting both is rejected before loading inventory. A non-empty filter continues to restrict targets even when `all_hosts=True`.
+
+Example: discover values → preview with `{"site": "tokyo", "role": "core"}` → run `run_netmiko_command(command="show version", filter_criteria={"site": "tokyo", "role": "core"})`. For NetBox, use the exact nested filters returned by discovery.
+
 ## Testing
 
 Unit tests live in `tests/`.

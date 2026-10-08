@@ -64,6 +64,8 @@ Both are gitignored — they hold device credentials.
 
 ### The tool pattern
 
+All task-running tools use `_target_nornir`: a non-empty filter or explicit `all_hosts=True` is required before inventory initialization. Discovery tools (`get_inventory_summary` / `preview_targets`) only read inventory, expose selection fields rather than arbitrary host data, and return structured dictionaries. Preview results include available filter values even when nothing matches; previews do not freeze targets for subsequent calls.
+
 Every `@mcp.tool()` that *runs tasks against hosts* follows the same shape, and new tools should match it. `get_inventory` is the deliberate exception: it only reads `nr.inventory`, so it has no `nr.run`, no `close_connections()` (it opens no connections), no `_format_agg_result`, and it returns `{}` rather than the no-match string. Don't "fix" it to conform.
 
 1. `_get_nornir(filter_criteria, num_workers=None)` — fresh `InitNornir` per call (no shared long-lived Nornir object), then `nr.filter(F(**filter_criteria))`.
