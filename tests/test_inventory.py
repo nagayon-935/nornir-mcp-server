@@ -105,3 +105,22 @@ def test_inventory_serializes_yaml_date_values(patched_nornir):
     patched_nornir(FakeNornir(hosts={"router1": fake_host(commissioned=date(2026, 1, 1))}))
 
     assert json.loads(get_inventory())["router1"]["data"]["commissioned"] == "2026-01-01"
+
+
+def test_inventory_forwards_filter_criteria(patched_nornir):
+    patched_nornir(FakeNornir(hosts={"router1": fake_host()}))
+
+    get_inventory(filter_criteria={"site": "tokyo"})
+
+    assert patched_nornir.calls[-1] == {"filter_criteria": {"site": "tokyo"}, "num_workers": None}
+
+
+def test_inventory_reports_error_when_loading_fails(monkeypatch):
+    def fail_get_nornir(*args, **kwargs):
+        raise RuntimeError("missing hosts.yaml")
+
+    monkeypatch.setattr(server, "_get_nornir", fail_get_nornir)
+
+    output = get_inventory(filter_criteria={"site": "tokyo"})
+
+    assert output == "Error loading inventory: missing hosts.yaml"

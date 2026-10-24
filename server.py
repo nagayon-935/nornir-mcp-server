@@ -88,7 +88,8 @@ def _run_tool(
                 return NO_MATCH_MESSAGE
             return _format_agg_result(run(nr, stack))
     except Exception as e:
-        logger.exception(f"Error {action} ({log_context}filter={filter_criteria})")
+        prefix = f"{log_context.removesuffix(', ')}, " if log_context else ""
+        logger.exception(f"Error {action} ({prefix}filter={filter_criteria})")
         return f"Error {action}: {str(e)}"
 
 
@@ -136,17 +137,23 @@ def run_netmiko_command(command: str, filter_criteria: dict[str, Any] | None = N
         "executing command",
         filter_criteria,
         lambda nr, _: nr.run(task=netmiko_send_command, command_string=command, use_textfsm=use_textfsm),
-        log_context=f"command={command!r}, ",
+        log_context=f"command={command!r}",
     )
 
 
 def _get_tls_verify(host: Host) -> bool:
-    return bool(host.get("tls_verify", True))
+    verify = host.get("tls_verify")
+    if verify is None:
+        return True
+    if not isinstance(verify, bool):
+        raise ValueError(f"Invalid 'tls_verify' value {verify!r} for host {host.name}; expected a boolean.")
+    return verify
 
 
 def _get_http_timeout(host: Host) -> float:
     """Per-host request timeout; falls back to HTTP_TIMEOUT when unset."""
-    return float(host.get("http_timeout", HTTP_TIMEOUT))
+    timeout = host.get("http_timeout")
+    return HTTP_TIMEOUT if timeout is None else float(timeout)
 
 
 def custom_http_task(
@@ -154,13 +161,17 @@ def custom_http_task(
     clients: dict[bool, httpx.Client],
     method: str,
     path: str,
-    json_data: dict | None = None,
+    json_data: dict[str, Any] | None = None,
 ) -> Result:
     """Custom Nornir task to execute HTTP requests using shared clients."""
     # Build base URL from host attributes
     host = task.host
-    base_url = host.get("base_url", f"https://{host.hostname}")
-    headers = host.get("http_headers", {})
+    base_url = host.get("base_url")
+    if not base_url:
+        if not host.hostname:
+            raise ValueError(f"Cannot determine HTTP target for host {host.name}: set 'base_url' or 'hostname'.")
+        base_url = f"https://{host.hostname}"
+    headers = host.get("http_headers") or {}
     verify = _get_tls_verify(host)
     if not verify:
         logger.warning(f"TLS verification disabled for host {host.name}")
@@ -185,7 +196,7 @@ def run_http_request(
     method: str,
     path: str,
     filter_criteria: dict[str, Any] | None = None,
-    json_data: dict | None = None,
+    json_data: dict[str, Any] | None = None,
 ) -> str:
     """
     Run an HTTP API request (REST) concurrently on multiple hosts.
@@ -204,7 +215,7 @@ def run_http_request(
         # Register cleanup immediately, including for partial initialization.
         # Clients are shared across threads, one per TLS verification setting.
         verify_values = {_get_tls_verify(host) for host in nr.inventory.hosts.values()}
-        clients = {}
+        clients: dict[bool, httpx.Client] = {}
         for verify in verify_values:
             client = httpx.Client(verify=verify, timeout=HTTP_TIMEOUT)
             stack.callback(client.close)
@@ -215,7 +226,7 @@ def run_http_request(
         "executing HTTP request",
         filter_criteria,
         run,
-        log_context=f"method={method}, path={path}, ",
+        log_context=f"method={method}, path={path}",
     )
 
 
@@ -235,8 +246,8 @@ def custom_serial_task(task: Task, command: str) -> Result:
     """Custom Nornir task to execute commands via Serial port using Netmiko."""
     host = task.host
     serial_settings = host.get("serial_settings")
-    if not serial_settings:
-        raise ValueError("No 'serial_settings' found in host data.")
+    if not serial_settings or not isinstance(serial_settings, dict):
+        raise ValueError("No valid 'serial_settings' mapping found in host data.")
 
     device_type = _resolve_serial_device_type(serial_settings, host.platform)
     # 'device_type' is Netmiko metadata; the rest goes straight to pyserial.
@@ -273,7 +284,7 @@ def run_serial_command(command: str, filter_criteria: dict[str, Any] | None = No
         filter_criteria,
         lambda nr, _: nr.run(task=custom_serial_task, command=command),
         num_workers=1,
-        log_context=f"command={command!r}, ",
+        log_context=f"command={command!r}",
     )
 
 
