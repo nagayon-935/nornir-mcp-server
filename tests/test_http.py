@@ -1,5 +1,7 @@
+import logging
 from types import SimpleNamespace
 
+import pytest
 from nornir.core.task import Result
 
 import server
@@ -11,40 +13,74 @@ class TestHostHttpSettings:
     def test_tls_verify_defaults_to_enabled(self):
         assert _get_tls_verify(fake_host()) is True
 
+    def test_tls_verify_treats_none_as_enabled(self):
+        assert _get_tls_verify(fake_host(tls_verify=None)) is True
+
     def test_tls_verify_can_be_disabled(self):
         assert _get_tls_verify(fake_host(tls_verify=False)) is False
 
+    def test_tls_verify_rejects_non_boolean_values(self):
+        with pytest.raises(ValueError, match="tls_verify"):
+            _get_tls_verify(fake_host(tls_verify="false"))
+
     def test_http_timeout_defaults_to_module_constant(self):
         assert _get_http_timeout(fake_host()) == server.HTTP_TIMEOUT
+
+    def test_http_timeout_treats_none_as_default(self):
+        assert _get_http_timeout(fake_host(http_timeout=None)) == server.HTTP_TIMEOUT
 
     def test_http_timeout_is_overridable_per_host(self):
         assert _get_http_timeout(fake_host(http_timeout=45)) == 45.0
 
 
 class TestCustomHttpTask:
-    def _run(self, data, response, method="GET", path="/api/v1/system"):
+    def _run(self, data, response, method="GET", path="/api/v1/system", json_data=None):
         host = fake_host(**data)
-        client = FakeClient(response)
-        result = custom_http_task(SimpleNamespace(host=host), {True: client, False: client}, method, path)
-        return result, client.requests[0]
+        secure_client = FakeClient(response)
+        insecure_client = FakeClient(response)
+        result = custom_http_task(
+            SimpleNamespace(host=host),
+            {True: secure_client, False: insecure_client},
+            method,
+            path,
+            json_data=json_data,
+        )
+        active_client = insecure_client if data.get("tls_verify") is False else secure_client
+        return result, active_client.requests[0]
 
     def test_defaults_base_url_to_https_hostname(self):
         _, request = self._run({}, FakeResponse(payload={"ok": True}))
 
         assert request["url"] == "https://192.168.1.1/api/v1/system"
 
+    def test_raises_when_neither_base_url_nor_hostname_set(self):
+        host = fake_host(hostname=None)
+        client = FakeClient(FakeResponse(payload={}))
+
+        with pytest.raises(ValueError, match="base_url"):
+            custom_http_task(SimpleNamespace(host=host), {True: client}, "GET", "/api")
+
     def test_joins_base_url_and_path_without_doubling_slashes(self):
         _, request = self._run({"base_url": "https://dev.example/"}, FakeResponse(payload={}))
 
         assert request["url"] == "https://dev.example/api/v1/system"
 
-    def test_passes_per_host_timeout_and_headers(self):
+    def test_passes_per_host_timeout_headers_and_json_payload(self):
         data = {"http_timeout": 30, "http_headers": {"X-Auth": "token"}}
 
-        _, request = self._run(data, FakeResponse(payload={}))
+        _, request = self._run(data, FakeResponse(payload={}), method="POST", json_data={"enabled": True})
 
+        assert request["method"] == "POST"
         assert request["timeout"] == 30.0
         assert request["headers"] == {"X-Auth": "token"}
+        assert request["json"] == {"enabled": True}
+
+    def test_selects_insecure_client_and_logs_warning_when_tls_disabled(self, caplog):
+        with caplog.at_level(logging.WARNING):
+            _, request = self._run({"tls_verify": False}, FakeResponse(payload={"ok": True}))
+
+        assert request["url"] == "https://192.168.1.1/api/v1/system"
+        assert "TLS verification disabled for host router1" in caplog.text
 
     def test_returns_parsed_json_body(self):
         result, _ = self._run({}, FakeResponse(payload={"version": "17.3"}))

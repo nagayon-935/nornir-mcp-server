@@ -7,6 +7,7 @@ from nornir.core.inventory import Host
 from nornir.core.task import AggregatedResult, MultiResult, Result
 
 from server import (
+    NO_MATCH_MESSAGE,
     generate_config,
     run_http_request,
     run_netmiko_command,
@@ -14,12 +15,21 @@ from server import (
     run_serial_command,
 )
 
-NO_MATCH_MESSAGE = "No hosts matched the filter criteria."
+__all__ = [
+    "CONNECTION_TOOLS",
+    "FakeClient",
+    "FakeConnectHandler",
+    "FakeNornir",
+    "FakeResponse",
+    "NO_MATCH_MESSAGE",
+    "build_agg_result",
+    "fake_host",
+]
 
 
-def fake_host(**data) -> Host:
+def fake_host(hostname: str | None = "192.168.1.1", **data) -> Host:
     """Build a real inventory host without opening device connections."""
-    return Host(name="router1", hostname="192.168.1.1", data=data)
+    return Host(name="router1", hostname=hostname, data=data)
 
 
 def build_agg_result(result: Result) -> AggregatedResult:

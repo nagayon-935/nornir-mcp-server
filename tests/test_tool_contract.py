@@ -7,8 +7,69 @@ from nornir.core.task import Result
 from nornir.plugins.runners import SerialRunner
 
 import server
-from server import _JINJA_ENV, generate_config, get_inventory, run_netmiko_command, run_serial_command
+from server import (
+    _JINJA_ENV,
+    _get_nornir,
+    custom_http_task,
+    custom_serial_task,
+    generate_config,
+    get_inventory,
+    netmiko_send_command,
+    netmiko_send_config,
+    run_http_request,
+    run_netmiko_command,
+    run_netmiko_config,
+    run_serial_command,
+)
 from tests.support import CONNECTION_TOOLS, NO_MATCH_MESSAGE, FakeNornir, build_agg_result, fake_host
+
+
+class TestGetNornir:
+    def test_initializes_with_config_file_and_no_filter_by_default(self, monkeypatch):
+        init_calls = []
+
+        class RecordingNornir:
+            def __init__(self):
+                self.filters = []
+
+            def filter(self, f_obj):
+                self.filters.append(f_obj)
+                return self
+
+        fake_nr = RecordingNornir()
+
+        def fake_init_nornir(**kwargs):
+            init_calls.append(kwargs)
+            return fake_nr
+
+        monkeypatch.setattr(server, "InitNornir", fake_init_nornir)
+
+        result = _get_nornir()
+
+        assert result is fake_nr
+        assert init_calls == [{"config_file": str(server.CONFIG_FILE)}]
+        assert fake_nr.filters == []
+
+    def test_applies_filter_and_num_workers_when_specified(self, monkeypatch):
+        init_calls = []
+        filter_calls = []
+
+        class RecordingNornir:
+            def filter(self, f_obj):
+                filter_calls.append(f_obj)
+                return self
+
+        monkeypatch.setattr(server, "InitNornir", lambda **kwargs: (init_calls.append(kwargs), RecordingNornir())[1])
+
+        _get_nornir(filter_criteria={"role": "core", "site": "tokyo"}, num_workers=1)
+
+        assert init_calls == [
+            {
+                "config_file": str(server.CONFIG_FILE),
+                "runner": {"plugin": "threaded", "options": {"num_workers": 1}},
+            }
+        ]
+        assert len(filter_calls) == 1
 
 
 class TestNoHostsShortCircuit:
@@ -50,9 +111,9 @@ class TestConnectionCleanup:
 
 
 class TestToolRunnerArguments:
-    def test_serial_command_forces_single_worker(self, patched_nornir):
+    def test_serial_command_forces_single_worker_and_passes_command(self, patched_nornir):
         agg_result = build_agg_result(Result(host=None, result="ok"))
-        patched_nornir(FakeNornir(hosts={"router1": fake_host()}, agg_result=agg_result))
+        nr = patched_nornir(FakeNornir(hosts={"router1": fake_host()}, agg_result=agg_result))
 
         run_serial_command("show version", filter_criteria={"site": "tokyo"})
 
@@ -60,6 +121,38 @@ class TestToolRunnerArguments:
             "filter_criteria": {"site": "tokyo"},
             "num_workers": 1,
         }
+        assert nr.run_calls == [(custom_serial_task, {"command": "show version"})]
+
+    def test_netmiko_command_forwards_command_and_textfsm_flag(self, patched_nornir):
+        agg_result = build_agg_result(Result(host=None, result="ok"))
+        nr = patched_nornir(FakeNornir(hosts={"router1": fake_host()}, agg_result=agg_result))
+
+        run_netmiko_command("show ip int brief", filter_criteria={"role": "core"}, use_textfsm=True)
+
+        assert patched_nornir.calls[-1] == {"filter_criteria": {"role": "core"}, "num_workers": None}
+        assert nr.run_calls == [(netmiko_send_command, {"command_string": "show ip int brief", "use_textfsm": True})]
+
+    def test_netmiko_config_forwards_config_commands(self, patched_nornir):
+        agg_result = build_agg_result(Result(host=None, result="ok"))
+        nr = patched_nornir(FakeNornir(hosts={"router1": fake_host()}, agg_result=agg_result))
+
+        run_netmiko_config(["interface Gi0/1", "description uplink"], filter_criteria={"role": "core"})
+
+        assert patched_nornir.calls[-1] == {"filter_criteria": {"role": "core"}, "num_workers": None}
+        assert nr.run_calls == [(netmiko_send_config, {"config_commands": ["interface Gi0/1", "description uplink"]})]
+
+    def test_http_request_forwards_method_path_and_json_data(self, patched_nornir):
+        agg_result = build_agg_result(Result(host=None, result="ok"))
+        nr = patched_nornir(FakeNornir(hosts={"router1": fake_host()}, agg_result=agg_result))
+
+        run_http_request("POST", "/api/v1/items", filter_criteria={"site": "tokyo"}, json_data={"key": "val"})
+
+        assert patched_nornir.calls[-1] == {"filter_criteria": {"site": "tokyo"}, "num_workers": None}
+        task, run_kwargs = nr.run_calls[0]
+        assert task is custom_http_task
+        assert run_kwargs["method"] == "POST"
+        assert run_kwargs["path"] == "/api/v1/items"
+        assert run_kwargs["json_data"] == {"key": "val"}
 
     @pytest.mark.parametrize(
         "tool,kwargs",

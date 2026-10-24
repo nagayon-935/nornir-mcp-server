@@ -79,3 +79,9 @@ class TestCustomSerialTask:
             custom_serial_task(self._build_task(data={}), "show version")
 
         assert connect_handler.instances == []
+
+    def test_raises_when_serial_settings_is_not_a_mapping(self, connect_handler):
+        with pytest.raises(ValueError, match="serial_settings"):
+            custom_serial_task(self._build_task(data={"serial_settings": "/dev/ttyUSB0"}), "show version")
+
+        assert connect_handler.instances == []

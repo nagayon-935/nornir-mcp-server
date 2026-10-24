@@ -6,7 +6,7 @@ WORKDIR /app
 
 # Install dependencies
 COPY pyproject.toml uv.lock ./
-RUN uv sync --frozen --no-cache
+RUN uv sync --frozen --no-dev --no-cache
 
 # --- Final Stage ---
 FROM python:3.13-slim
